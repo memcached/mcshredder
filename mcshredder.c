@@ -94,6 +94,12 @@ struct mcs_f_rate {
     struct __kernel_timespec next; // next absolute time to schedule the alarm for
 };
 
+// governs when to naturally reconnect
+struct mcs_f_reconn {
+    unsigned int every; // how often to reconnect
+    unsigned int after; // counter until next reconnect
+};
+
 // TODO: func or macro for state changes so can be printed.
 enum mcs_func_state {
     mcs_fstate_disconn = 0,
@@ -107,6 +113,7 @@ enum mcs_func_state {
     mcs_fstate_read,
     mcs_fstate_postread,
     mcs_fstate_rerun,
+    mcs_fstate_restart,
     mcs_fstate_syserr,
 };
 
@@ -139,7 +146,8 @@ struct mcs_func {
     char *fname; // name of function to call
     bool linked;
     enum mcs_func_state state;
-    struct mcs_f_rate rate; // rate limiter.
+    struct mcs_f_rate rate; // rate limiter
+    struct mcs_f_reconn reconn; // tcp reconnector
     struct mcs_event ev;
     struct mcs_conn conn;
     void *mcmc; // mcmc client object
@@ -525,6 +533,18 @@ static void mcs_syserror(struct mcs_func *f) {
     f->state = mcs_fstate_retry;
 }
 
+static void mcs_restart(struct mcs_func *f) {
+    f->state = mcs_fstate_run;
+    if (f->reconn.every != 0) {
+        f->reconn.after--;
+        if (f->reconn.after == 0) {
+            mcmc_disconnect(f->mcmc);
+            f->reconn.after = f->reconn.every;
+            f->state = mcs_fstate_disconn;
+        }
+    }
+}
+
 // run the function state machine.
 // called _outside_ of the cqe reception loop
 // must return -1 if we tried to allocate an SQE for some reason and couldn't.
@@ -560,9 +580,12 @@ static int mcs_func_run(void *udata) {
         case mcs_fstate_run:
             mcs_func_lua(f);
             break;
+        case mcs_fstate_restart:
+            mcs_restart(f);
+            break;
         case mcs_fstate_rerun:
             if (mcs_reschedule(f) == 0) {
-                f->state = mcs_fstate_run;
+                f->state = mcs_fstate_restart;
                 stop = true;
             } else {
                 return -1;
@@ -838,6 +861,7 @@ static int mcslib_run(lua_State *L) {
     struct mcs_thread *t = lua_touserdata(L, 1);
     int conns = 1;
     struct mcs_f_rate frate = {0};
+    struct mcs_f_reconn freconn = {0};
 
     if (lua_getfield(L, 2, "conns") != LUA_TNIL) {
         conns = lua_tointeger(L, -1);
@@ -856,6 +880,12 @@ static int mcslib_run(lua_State *L) {
     if (lua_getfield(L, 2, "rate_period") != LUA_TNIL) {
         frate.period = lua_tointeger(L, -1);
         frate.period *= NSEC_PER_SEC / 1000; // ms to ns
+    }
+    lua_pop(L, 1);
+
+    if (lua_getfield(L, 2, "reconn_every") != LUA_TNIL) {
+        freconn.every = lua_tointeger(L, -1);
+        freconn.after = freconn.every;
     }
     lua_pop(L, 1);
 
@@ -893,6 +923,7 @@ static int mcslib_run(lua_State *L) {
         lua_pop(L, 1);
 
         f->rate = frate;
+        f->reconn = freconn;
 
         memcpy(&f->conn, &ctx->conn, sizeof(f->conn));
 

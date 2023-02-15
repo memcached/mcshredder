@@ -14,6 +14,7 @@ function config()
     --             in this case 5 connections will run a total of 100 rps.
     -- rate_period: in milliseconds, the time period for the rate limit,
     -- default 1000 (one second)
+    -- reconn_every: force the client to reconnect every N requests.
     mcs.run(t1, { func = "metaget", conns = 5, rate_limit = 100 })
     -- Multiple workloads can run on the same thread.
     -- mcs.run(t1, { func = "toast", conns = 5 })
