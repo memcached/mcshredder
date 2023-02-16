@@ -6,7 +6,7 @@ function config()
     -- pre-warming function
     print("starting pre-warm")
     local warm = mcs.thread()
-    mcs.run(warm, { func = "warm", conns = 1, limit = 1000 })
+    mcs.run(warm, { func = "warm", clients = 1, limit = 1000 })
     mcs.shredder({warm}, 30) -- wait up to 30 seconds for warmer to run
     print("warming completed")
 
@@ -17,20 +17,20 @@ function config()
     -- NOTE:
     -- func must be a "string", as each thread gets a unique lua VM, requiring
     -- an indirect calling convention.
-    -- conns: number of independent client connections to run
-    -- rate_limit: the total requests per second to target across all conns
+    -- clients: number of concurrent client connections to run
+    -- rate_limit: the total requests per second to target across all clients
     --             in this case 5 connections will run a total of 100 rps.
     -- rate_period: in milliseconds, the time period for the rate limit,
     -- default 1000 (one second)
     -- reconn_every: force the client to reconnect every N requests.
     -- limit: number of times to run each function for each connection
-    mcs.run(t1, { func = "metaget", conns = 5, rate_limit = 100 })
+    mcs.run(t1, { func = "metaget", clients = 5, rate_limit = 100 })
     -- Multiple workloads can run on the same thread.
-    -- mcs.run(t1, { func = "toast", conns = 5 })
+    -- mcs.run(t1, { func = "toast", clients = 5 })
 
     -- Optionally, we can create more threads in order to scale workloads.
     -- local t2 = mcs.thread()
-    -- mcs.run(t2, { func = "basic", conns = 25, rate_limit = 10000 })
+    -- mcs.run(t2, { func = "basic", clients = 25, rate_limit = 10000 })
 
     -- Run the test for 10 seconds.
     -- If no argument passed, wait for a kill or stop signal.

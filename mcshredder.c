@@ -887,7 +887,7 @@ static int mcslib_thread(lua_State *L) {
 // takes mcsthread, table
 // configures thread.
 // arguments:
-// conns, rate_limit, rate_period, reconn_every, reconn_random, ramp_period,
+// clients, rate_limit, rate_period, reconn_every, reconn_random, ramp_period,
 // start_delay
 static int mcslib_run(lua_State *L) {
     struct mcs_ctx *ctx = *(struct mcs_ctx **)lua_getextraspace(L);
@@ -895,18 +895,18 @@ static int mcslib_run(lua_State *L) {
     luaL_checktype(L, 2, LUA_TTABLE);
 
     struct mcs_thread *t = lua_touserdata(L, 1);
-    int conns = 1;
+    int clients = 1;
     int limit = 0;
     struct mcs_f_rate frate = {0};
     struct mcs_f_reconn freconn = {0};
 
-    if (lua_getfield(L, 2, "conns") != LUA_TNIL) {
-        conns = lua_tointeger(L, -1);
+    if (lua_getfield(L, 2, "clients") != LUA_TNIL) {
+        clients = lua_tointeger(L, -1);
     }
     lua_pop(L, 1);
 
     // seed the "rate" to be one per second per connection.
-    frate.rate = conns;
+    frate.rate = clients;
 
     if (lua_getfield(L, 2, "rate_limit") != LUA_TNIL) {
         frate.rate = lua_tointeger(L, -1);
@@ -934,13 +934,13 @@ static int mcslib_run(lua_State *L) {
     // request rate is specified as total across all connections
     // divide it down to per-connection here.
     if (frate.rate != 0) {
-        frate.rate /= conns;
+        frate.rate /= clients;
         uint64_t rate_div = frate.period / frate.rate;
         frate.delta.tv_sec = rate_div / NSEC_PER_SEC;
         frate.delta.tv_nsec = rate_div - frate.delta.tv_sec * NSEC_PER_SEC;
     }
 
-    for (int x = 0; x < conns; x++) {
+    for (int x = 0; x < clients; x++) {
         // create coroutine using thread VM.
         struct mcs_func *f = lua_newuserdatauv(t->L, sizeof(struct mcs_func), 0);
         memset(f, 0, sizeof(struct mcs_func));
