@@ -985,7 +985,6 @@ static int mcslib_run(lua_State *L) {
 static void _mcs_cleanup_thread(struct mcs_thread *t) {
     struct mcs_func *f = NULL;
 
-    io_uring_queue_exit(&t->ring);
     STAILQ_FOREACH(f, &t->funcs, next) {
         free(f->rbuf);
         free(f->wbuf);
@@ -996,9 +995,9 @@ static void _mcs_cleanup_thread(struct mcs_thread *t) {
         // do not free the function: it's owned by the lua state
     }
     STAILQ_INIT(&t->funcs);
-    // free the thread's lua VM.
     // NOTE: attempting to make threads re-usable, so we leave the VM open.
     // lua_close(t->L);
+    // io_uring_queue_exit(&t->ring);
     // do not free the thread object, it is owned by the context VM.
 }
 

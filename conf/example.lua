@@ -4,8 +4,6 @@
 function config()
     -- example of calling mcs.shredder() multiple times to create a
     -- pre-warming function
-    -- WARNING: do not re-use the same thread for multiple shredder calls
-    -- create a new set of threads for different runs
     print("starting pre-warm")
     local warm = mcs.thread()
     mcs.run(warm, { func = "warm", conns = 1, limit = 1000 })
