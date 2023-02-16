@@ -1105,6 +1105,18 @@ static int mcslib_resline(lua_State *L) {
     return 1;
 }
 
+static int mcslib_res_statname(lua_State *L) {
+    struct mcs_func_resp *r = lua_touserdata(L, -1);
+    lua_pushlstring(L, r->resp.sname, r->resp.snamelen);
+    return 1;
+}
+
+static int mcslib_res_stat(lua_State *L) {
+    struct mcs_func_resp *r = lua_touserdata(L, -1);
+    lua_pushlstring(L, r->resp.stat, r->resp.statlen);
+    return 1;
+}
+
 // get(prefix, number)
 static int mcslib_get(lua_State *L) {
     struct mcs_func_req *req = lua_newuserdatauv(L, sizeof(struct mcs_func_req) + REQ_MAX_LENGTH, 0);
@@ -1269,6 +1281,8 @@ static void register_lua_libs(lua_State *L) {
         {"read", mcslib_read},
         // object functions.
         {"resline", mcslib_resline},
+        {"res_stat", mcslib_res_stat},
+        {"res_statname", mcslib_res_statname},
         // request functions.
         {"get", mcslib_get},
         {"set", mcslib_set},

@@ -30,8 +30,10 @@ function config()
     -- mcs.run(t1, { func = "toast", clients = 5 })
 
     -- Optionally, we can create more threads in order to scale workloads.
-    -- local t2 = mcs.thread()
+    local t2 = mcs.thread()
     -- mcs.run(t2, { func = "basic", clients = 25, rate_limit = 10000 })
+    -- watch stats output from another thread
+    mcs.run(t2, { func = "statsample", clients = 1, rate_limit = 1, period = 2000 })
 
     -- Run the test for 10 seconds.
     -- If no argument passed, wait for a kill or stop signal.
@@ -97,6 +99,40 @@ function metaget()
         mcs.flush()
         local res = mcs.read()
     end
+end
+
+-- print some stats output periodically.
+-- controlled by the rate/period settings from mcs.run()
+--
+-- I'm building towards having internal feedback loops: if the request rate is
+-- less than expected, stop the test or print warnings, etc.
+--
+-- If you are building sets of tests, you should create libraries with code
+-- like below and import them via require or dofile rather than copy/paste.
+local previous_stats = {}
+local stats_ready = false
+local track_stats = { "cmd_get", "cmd_set" }
+function statsample()
+    mcs.write("stats\r\n")
+    mcs.flush()
+    local stats = {}
+    while true do
+        local res = mcs.read()
+        if mcs.resline(res) == "END\r\n" then
+            break
+        end
+        stats[mcs.res_statname(res)] = mcs.res_stat(res)
+    end
+
+    if stats_ready then
+        for _, s in pairs(track_stats) do
+            local count = stats[s] - previous_stats[s]
+            print(s, ": ", count)
+        end
+    end
+
+    previous_stats = stats
+    stats_ready = true
 end
 
 
