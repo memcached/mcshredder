@@ -11,11 +11,12 @@ function config()
     print("warming completed")
 
     print("starting test")
-    -- Create a dedicated POSIX thread
+    -- Create a dedicated OS thread
     local t1 = mcs.thread()
+
     -- Attach a workload to this thread.
     -- NOTE:
-    -- func must be a "string", as each thread gets a unique lua VM, requiring
+    -- func must be a string, as each thread gets a unique lua VM, requiring
     -- an indirect calling convention.
     -- clients: number of concurrent client connections to run
     -- rate_limit: the total requests per second to target across all clients
@@ -23,9 +24,9 @@ function config()
     -- rate_period: in milliseconds, the time period for the rate limit,
     -- default 1000 (one second)
     -- reconn_every: force the client to reconnect every N requests.
-    -- limit: number of times to run each function for each connection
+    -- limit: number of times to run each function for each client
     mcs.run(t1, { func = "metaget", clients = 5, rate_limit = 100 })
-    -- Multiple workloads can run on the same thread.
+    -- Multiple workloads can run on the same OS thread.
     -- mcs.run(t1, { func = "toast", clients = 5 })
 
     -- Optionally, we can create more threads in order to scale workloads.
@@ -38,6 +39,9 @@ function config()
     print("done")
 end
 
+-- we use a global counter here, note that any global variable will be local
+-- to each OS thread created, as each OS thread uses an independent lua VM
+-- loading this same code.
 local counter = 0
 -- another way to do this: set "limit" in mcs.run() to 1 and loop inside the
 -- warming function.
@@ -51,18 +55,33 @@ end
 
 function basic()
     local num = math.random(20)
+    -- create a request object with the request string inside.
     local req = mcs.get("toast/", num)
+    -- write the request to the client write buffer
     mcs.write(req)
+    -- flush the request out to the network
+    -- this suspends and later resumes this coroutine, allowing other
+    -- clients to run on the same OS thread concurrently.
     mcs.flush()
+
+    -- wait for a response and parse it into a response object.
     local res = mcs.read()
+    -- NOTE: a response object is only valid until the next time mcs.read() is
+    -- called: res points directly into the client read buffer, which moves
+    -- every time read() is called.
+    --
+    -- check if we had a miss.
     if mcs.resline(res) == "END\r\n" then
+        -- similar to above, but create a set backfill
         local set = mcs.set("toast/", num, 0, 90, 100)
         mcs.write(set)
         mcs.flush()
         local res = mcs.read()
+        -- note validating the response here is optional.
     else
         -- If we got a hit, we need to still read the END marker.
         local res = mcs.read()
+        -- note we're not validating the END marker here.
     end
 end
 
