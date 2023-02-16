@@ -176,6 +176,7 @@ struct mcs_thread {
     int active_funcs; // stop if no active functions
     struct io_uring ring;
     pthread_t tid;
+    bool stop;
 };
 
 typedef STAILQ_HEAD(thread_head_s, mcs_thread) thread_head_t;
@@ -557,7 +558,13 @@ static void mcs_restart(struct mcs_func *f) {
             mcmc_disconnect(f->mcmc);
             f->reconn.after = f->reconn.every;
             f->state = mcs_fstate_disconn;
+            return;
         }
+    }
+    if (f->parent->stop) {
+        mcmc_disconnect(f->mcmc);
+        f->state = mcs_fstate_stop;
+        return;
     }
 }
 
@@ -805,6 +812,7 @@ static void mcs_queue_cb(void *udata, struct io_uring_cqe *cqe) {
 
 static void *shredder_thread(void *arg) {
     struct mcs_thread *t = arg;
+    t->stop = false;
 
     // uring core loop
     // TODO: check stop flag in loop.
@@ -1045,12 +1053,13 @@ static int mcslib_shredder(lua_State *L) {
         if (use_wait) {
             int res = pthread_cond_timedwait(&ctx->wait_cond, &ctx->wait_lock, &wait);
             if (res == ETIMEDOUT) {
-                pthread_mutex_unlock(&ctx->wait_lock);
-                // TODO: signal stop request to threads, let them gracefully
-                // clean up, then continue waiting on these conditions.
-                // for now they will continue to run
-                return 0;
-                // TODO: just throw a lua error for now?
+                // loosely signal threads to stop
+                // note lack of locking making this imperfect
+                STAILQ_FOREACH(t, &ctx->threads, next) {
+                    t->stop = true;
+                }
+                use_wait = false;
+                continue; // retry the loop.
             }
         } else {
             pthread_cond_wait(&ctx->wait_cond, &ctx->wait_lock);
