@@ -2,6 +2,16 @@
 -- which configures thread objects, attaches workloads to thread objects, then
 -- runs the test.
 function config()
+    -- example of calling mcs.shredder() multiple times to create a
+    -- pre-warming function
+    -- WARNING: do not re-use the same thread for multiple shredder calls
+    -- create a new set of threads for different runs
+    print("starting pre-warm")
+    local warm = mcs.thread()
+    mcs.run(warm, { func = "warm", conns = 1, limit = 1000 })
+    mcs.shredder({warm}, 30) -- wait up to 30 seconds for warmer to run
+    print("warming completed")
+
     print("starting test")
     -- Create a dedicated POSIX thread
     local t1 = mcs.thread()
@@ -15,6 +25,7 @@ function config()
     -- rate_period: in milliseconds, the time period for the rate limit,
     -- default 1000 (one second)
     -- reconn_every: force the client to reconnect every N requests.
+    -- limit: number of times to run each function for each connection
     mcs.run(t1, { func = "metaget", conns = 5, rate_limit = 100 })
     -- Multiple workloads can run on the same thread.
     -- mcs.run(t1, { func = "toast", conns = 5 })
@@ -25,8 +36,19 @@ function config()
 
     -- Run the test for 10 seconds.
     -- If no argument passed, wait for a kill or stop signal.
-    mcs.shredder(10)
+    mcs.shredder({t1}, 10)
     print("done")
+end
+
+local counter = 0
+-- another way to do this: set "limit" in mcs.run() to 1 and loop inside the
+-- warming function.
+function warm()
+    local req = mcs.set("doot", counter, 0, 300, 50)
+    mcs.write(req)
+    mcs.flush()
+    local res = mcs.read()
+    counter = counter + 1
 end
 
 function basic()

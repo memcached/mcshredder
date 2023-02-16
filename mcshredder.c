@@ -64,6 +64,7 @@ struct __kernel_timespec timeout_default = { .tv_sec = 0, .tv_nsec = 500000000 }
 struct __kernel_timespec timeout_retry = { .tv_sec = 0, .tv_nsec = 500000000 };
 struct mcs_thread;
 struct mcs_func;
+struct mcs_ctx;
 
 static void register_lua_libs(lua_State *L);
 static void mcs_queue_cb(void *udata, struct io_uring_cqe *cqe);
@@ -115,6 +116,7 @@ enum mcs_func_state {
     mcs_fstate_rerun,
     mcs_fstate_restart,
     mcs_fstate_syserr,
+    mcs_fstate_stop,
 };
 
 enum mcs_lua_yield {
@@ -150,6 +152,7 @@ struct mcs_func {
     struct mcs_f_reconn reconn; // tcp reconnector
     struct mcs_event ev;
     struct mcs_conn conn;
+    int limit; // stop running after N loops
     void *mcmc; // mcmc client object
     int cqe_res; // result of most recent cqe
     int lua_nargs; // number of args to pass back to lua
@@ -166,17 +169,22 @@ struct mcs_func {
 
 typedef STAILQ_HEAD(func_head_s, mcs_func) func_head_t;
 struct mcs_thread {
+    struct mcs_ctx *ctx;
     lua_State *L; // lua VM local to this thread
     STAILQ_ENTRY(mcs_thread) next; // thread stack
     func_head_t funcs; // coroutine stack
-    pthread_t tid;
+    int active_funcs; // stop if no active functions
     struct io_uring ring;
+    pthread_t tid;
 };
 
 typedef STAILQ_HEAD(thread_head_s, mcs_thread) thread_head_t;
 struct mcs_ctx {
     lua_State *L;
     thread_head_t threads; // stack of threads
+    pthread_cond_t wait_cond; // thread completion signal
+    pthread_mutex_t wait_lock;
+    int active_threads; // return from shredder() if threads stopped
     const char *conffile;
     struct mcs_conn conn; // connection details.
 };
@@ -535,6 +543,14 @@ static void mcs_syserror(struct mcs_func *f) {
 
 static void mcs_restart(struct mcs_func *f) {
     f->state = mcs_fstate_run;
+    if (f->limit != 0) {
+        f->limit--;
+        if (f->limit == 0) {
+            mcmc_disconnect(f->mcmc);
+            f->state = mcs_fstate_stop;
+            return;
+        }
+    }
     if (f->reconn.every != 0) {
         f->reconn.after--;
         if (f->reconn.after == 0) {
@@ -627,6 +643,10 @@ static int mcs_func_run(void *udata) {
             break;
         case mcs_fstate_syserr:
             mcs_syserror(f);
+            break;
+        case mcs_fstate_stop:
+            f->parent->active_funcs--;
+            stop = true;
             break;
         default:
             abort();
@@ -816,8 +836,16 @@ static void *shredder_thread(void *arg) {
             }
         }
 
+        if (t->active_funcs == 0) {
+            break;
+        }
+
         io_uring_submit_and_wait(&t->ring, 1);
     }
+
+    pthread_mutex_lock(&t->ctx->wait_lock);
+    pthread_cond_signal(&t->ctx->wait_cond);
+    pthread_mutex_unlock(&t->ctx->wait_lock);
 
     return NULL;
 }
@@ -830,6 +858,8 @@ static int mcslib_thread(lua_State *L) {
     struct mcs_thread *t = lua_newuserdatauv(ctx->L, sizeof(struct mcs_thread), 0);
     STAILQ_INIT(&t->funcs);
 
+    t->ctx = ctx;
+    t->active_funcs = 0;
     t->L = luaL_newstate();
     // TODO: what to stuff into the extraspace? ctx or thread?
     luaL_openlibs(t->L);
@@ -842,8 +872,6 @@ static int mcslib_thread(lua_State *L) {
     }
 
     init_thread_uring(t);
-
-    STAILQ_INSERT_TAIL(&ctx->threads, t, next);
 
     return 1;
 }
@@ -860,6 +888,7 @@ static int mcslib_run(lua_State *L) {
 
     struct mcs_thread *t = lua_touserdata(L, 1);
     int conns = 1;
+    int limit = 0;
     struct mcs_f_rate frate = {0};
     struct mcs_f_reconn freconn = {0};
 
@@ -889,6 +918,11 @@ static int mcslib_run(lua_State *L) {
     }
     lua_pop(L, 1);
 
+    if (lua_getfield(L, 2, "limit") != LUA_TNIL) {
+        limit = lua_tointeger(L, -1);
+    }
+    lua_pop(L, 1);
+
     // request rate is specified as total across all connections
     // divide it down to per-connection here.
     if (frate.rate != 0) {
@@ -903,6 +937,7 @@ static int mcslib_run(lua_State *L) {
         struct mcs_func *f = lua_newuserdatauv(t->L, sizeof(struct mcs_func), 0);
         memset(f, 0, sizeof(struct mcs_func));
         STAILQ_INSERT_TAIL(&t->funcs, f, next);
+        t->active_funcs++;
 
         f->parent = t;
 
@@ -924,6 +959,7 @@ static int mcslib_run(lua_State *L) {
 
         f->rate = frate;
         f->reconn = freconn;
+        f->limit = limit;
 
         memcpy(&f->conn, &ctx->conn, sizeof(f->conn));
 
@@ -946,10 +982,43 @@ static int mcslib_run(lua_State *L) {
     return 0;
 }
 
+static void _mcs_cleanup_thread(struct mcs_thread *t) {
+    struct mcs_func *f = NULL;
+
+    io_uring_queue_exit(&t->ring);
+    STAILQ_FOREACH(f, &t->funcs, next) {
+        free(f->rbuf);
+        free(f->wbuf);
+        free(f->mcmc);
+        free(f->fname);
+        luaL_unref(t->L, LUA_REGISTRYINDEX, f->self_ref);
+        luaL_unref(t->L, LUA_REGISTRYINDEX, f->self_ref_coro);
+        // do not free the function: it's owned by the lua state
+    }
+    STAILQ_INIT(&t->funcs);
+    // free the thread's lua VM.
+    // NOTE: attempting to make threads re-usable, so we leave the VM open.
+    // lua_close(t->L);
+    // do not free the thread object, it is owned by the context VM.
+}
+
 // main VM: start threads, run threads
 static int mcslib_shredder(lua_State *L) {
     struct mcs_ctx *ctx = *(struct mcs_ctx **)lua_getextraspace(L);
 
+    ctx->active_threads = 0;
+    STAILQ_INIT(&ctx->threads);
+    luaL_checktype(L, 1, LUA_TTABLE);
+    int n = luaL_len(L, 1);
+    for (int x = 1; x <= n; x++) {
+        lua_geti(L, 1, x);
+        struct mcs_thread *t = lua_touserdata(L, -1);
+        lua_pop(L, 1);
+        STAILQ_INSERT_TAIL(&ctx->threads, t, next);
+        ctx->active_threads++;
+    }
+
+    pthread_mutex_lock(&ctx->wait_lock);
     struct mcs_thread *t;
     STAILQ_FOREACH(t, &ctx->threads, next) {
         int ret;
@@ -957,16 +1026,48 @@ static int mcslib_shredder(lua_State *L) {
         if (ret != 0) {
             fprintf(stderr, "Failed to start shredder thread: %s\n",
                     strerror(ret));
+            // FIXME: throw error and exit.
         }
     }
 
     int type = lua_type(L, -1);
+    struct timespec wait;
+    bool use_wait = false;;
 
     if (type == LUA_TNUMBER) {
         int tosleep = lua_tointeger(L, -1);
-        sleep(tosleep);
-    } else {
-        pause();
+        clock_gettime(CLOCK_REALTIME, &wait);
+        wait.tv_nsec = 0;
+        wait.tv_sec += tosleep;
+        use_wait = true;
+    }
+
+    while (ctx->active_threads) {
+        if (use_wait) {
+            int res = pthread_cond_timedwait(&ctx->wait_cond, &ctx->wait_lock, &wait);
+            if (res == ETIMEDOUT) {
+                pthread_mutex_unlock(&ctx->wait_lock);
+                // TODO: signal stop request to threads, let them gracefully
+                // clean up, then continue waiting on these conditions.
+                // for now they will continue to run
+                return 0;
+                // TODO: just throw a lua error for now?
+            }
+        } else {
+            pthread_cond_wait(&ctx->wait_cond, &ctx->wait_lock);
+        }
+        ctx->active_threads--;
+        if (ctx->active_threads == 0) {
+            pthread_mutex_unlock(&ctx->wait_lock);
+            break;
+        }
+    }
+
+    // cleanup loop
+    STAILQ_FOREACH(t, &ctx->threads, next) {
+        // FIXME: assuming success.
+        pthread_join(t->tid, NULL);
+        _mcs_cleanup_thread(t);
     }
 
     return 0;
@@ -1211,8 +1312,9 @@ int main(int argc, char **argv) {
     }
 
     struct mcs_ctx *ctx = calloc(1, sizeof(struct mcs_ctx));
-    STAILQ_INIT(&ctx->threads);
     memcpy(&ctx->conn, &conn, sizeof(conn));
+    pthread_mutex_init(&ctx->wait_lock, NULL);
+    pthread_cond_init(&ctx->wait_cond, NULL);
 
     // - create main VM
     lua_State *L = luaL_newstate();
