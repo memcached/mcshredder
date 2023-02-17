@@ -35,3 +35,8 @@ cscope.out
 /memcached.spec
 .*.swp
 /compile_commands.json
+/vendor/lua/src/lua
+/vendor/lua/src/luac
+/vendor/mcmc/example
+/vendor/liburing/test/*.t
+/vendor/liburing/examples/*
