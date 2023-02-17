@@ -480,7 +480,7 @@ static int mcs_read_buf(struct mcs_func *f) {
         f->state = mcs_fstate_read;
     } else {
         // TODO: real error.
-        fprintf(stderr, "Buffer read failed with bad response, exiting: %s\n", f->rbuf);
+        fprintf(stderr, "Buffer read failed with bad response, exiting: %.*s\n", f->rbuf_used, f->rbuf);
         abort();
     }
 
