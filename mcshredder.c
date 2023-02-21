@@ -93,6 +93,7 @@ struct mcs_f_rate {
     uint64_t period; // stored in nanoseconds.
     struct __kernel_timespec delta; // period / rate in timespec format
     struct __kernel_timespec next; // next absolute time to schedule the alarm for
+    struct __kernel_timespec start; // post-connect start offset
 };
 
 // governs when to naturally reconnect
@@ -600,7 +601,7 @@ static int mcs_func_run(void *udata) {
                 f->state = mcs_fstate_retry;
             } else {
                 mcs_start_limiter(f);
-                f->state = mcs_fstate_run;
+                f->state = mcs_fstate_rerun;
             }
             break;
         case mcs_fstate_run:
@@ -799,8 +800,8 @@ static void mcs_start_limiter(struct mcs_func *f) {
     f->rate.next.tv_sec = ts.tv_sec;
     f->rate.next.tv_nsec = ts.tv_nsec;
 
-    // add time delta to schedule the next run.
-    timespec_add(&f->rate.next, &f->rate.delta);
+    // add time delta to schedule the first run.
+    timespec_add(&f->rate.next, &f->rate.start);
 }
 
 // Only exists to escape us from the cqe loop.
@@ -936,11 +937,16 @@ static int mcslib_run(lua_State *L) {
 
     // request rate is specified as total across all connections
     // divide it down to per-connection here.
+    int start_rate = 0;
     if (frate.rate != 0) {
         frate.rate /= clients;
         uint64_t rate_div = frate.period / frate.rate;
         frate.delta.tv_sec = rate_div / NSEC_PER_SEC;
         frate.delta.tv_nsec = rate_div - frate.delta.tv_sec * NSEC_PER_SEC;
+
+        // we also need an initial offset for each client post-connect or a
+        // large number of clients will rush all of their requests at once.
+        start_rate = frate.period / clients;
     }
 
     for (int x = 0; x < clients; x++) {
@@ -969,6 +975,11 @@ static int mcslib_run(lua_State *L) {
         lua_pop(L, 1);
 
         f->rate = frate;
+        if (start_rate != 0) {
+            uint64_t start_offset = start_rate * x;
+            f->rate.start.tv_sec = start_offset / NSEC_PER_SEC;
+            f->rate.start.tv_nsec = start_offset - (f->rate.start.tv_sec * NSEC_PER_SEC);
+        }
         f->reconn = freconn;
         f->limit = limit;
 
