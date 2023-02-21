@@ -101,6 +101,22 @@ function metaget()
     end
 end
 
+-- example latency sampler.
+-- could get from main corpus of data, individually test timing of set/get
+-- routine, etc. run with a low rate limit to get trend data.
+function latency()
+    local req = mcs.set("canary", 0, 0, 10, 100)
+    mcs.write(req)
+    mcs.flush()
+
+    local res = mcs.read()
+    -- NOTE: as of writing "status" is meaningless.
+    -- mcs.match(req, res) will do basic validation that the response makes
+    -- sense for the request.
+    local status, elapsed = mcs.match(req, res)
+    print("sample time: " .. elapsed)
+end
+
 -- print some stats output periodically.
 -- controlled by the rate/period settings from mcs.run()
 --

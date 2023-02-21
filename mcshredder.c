@@ -135,6 +135,7 @@ struct mcs_func_req {
 // points into func's rbuf
 struct mcs_func_resp {
     int status;
+    struct timespec received; // time response was read from socket
     char *buf; // start of response buffer
     mcmc_resp_t resp;
 };
@@ -473,6 +474,8 @@ static int mcs_read_buf(struct mcs_func *f) {
             f->state = mcs_fstate_run;
             f->lua_nargs = 1;
             f->rbuf_toconsume = r->resp.reslen + r->resp.vlen_read;
+
+            clock_gettime(CLOCK_MONOTONIC, &r->received);
         }
     } else if (r->resp.code == MCMC_WANT_READ) {
         lua_pop(f->L, 1);
@@ -1117,6 +1120,22 @@ static int mcslib_res_stat(lua_State *L) {
     return 1;
 }
 
+// TODO: func should look at the type of request *req is, and ensure the
+// response received in *res makes sense, and the key or opaque matches if
+// supplied.
+static int mcslib_match(lua_State *L) {
+    struct mcs_func_req *req = lua_touserdata(L, 1);
+    struct mcs_func_resp *res = lua_touserdata(L, 2);
+
+    // TODO: first result is always true as match checking isn't implemented
+    lua_pushboolean(L, 1);
+
+    int elapsed = (res->received.tv_sec - req->start.tv_sec) * 1000000 +
+        (res->received.tv_nsec - req->start.tv_nsec) / 1000; // nano to micro
+    lua_pushinteger(L, elapsed);
+    return 2;
+}
+
 // get(prefix, number)
 static int mcslib_get(lua_State *L) {
     struct mcs_func_req *req = lua_newuserdatauv(L, sizeof(struct mcs_func_req) + REQ_MAX_LENGTH, 0);
@@ -1283,6 +1302,7 @@ static void register_lua_libs(lua_State *L) {
         {"resline", mcslib_resline},
         {"res_stat", mcslib_res_stat},
         {"res_statname", mcslib_res_statname},
+        {"match", mcslib_match},
         // request functions.
         {"get", mcslib_get},
         {"set", mcslib_set},
