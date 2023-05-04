@@ -888,24 +888,84 @@ static int mcslib_thread(lua_State *L) {
     return 1;
 }
 
+static struct mcs_func *mcs_add_func(struct mcs_thread *t) {
+    // create coroutine using thread VM.
+    struct mcs_func *f = lua_newuserdatauv(t->L, sizeof(struct mcs_func), 0);
+    memset(f, 0, sizeof(struct mcs_func));
+    STAILQ_INSERT_TAIL(&t->funcs, f, next);
+    t->active_funcs++;
+
+    f->parent = t;
+
+    // prepare the function's coroutine
+    lua_newthread(t->L);
+    lua_State *Lc = lua_tothread(t->L, -1);
+    f->L = Lc;
+    // pops thread
+    f->self_ref_coro = luaL_ref(t->L, LUA_REGISTRYINDEX);
+    // pop the func
+    f->self_ref = luaL_ref(t->L, LUA_REGISTRYINDEX);
+
+    // allocate mcmc client
+    f->mcmc = calloc(1, mcmc_size(MCMC_OPTION_BLANK));
+
+    // kick off the state machine.
+    f->ev.qcb = mcs_func_run;
+    f->ev.cb = mcs_queue_cb;
+    f->ev.udata = f;
+    f->state = mcs_fstate_disconn;
+
+    f->wbuf = malloc(WBUF_INITIAL_SIZE);
+    f->wbuf_size = WBUF_INITIAL_SIZE;
+
+    f->rbuf = malloc(RBUF_INITIAL_SIZE);
+    f->rbuf_size = RBUF_INITIAL_SIZE;
+
+    return f;
+}
+
 // takes mcsthread, table
+// or table of mcsthread, table
 // configures thread.
 // arguments:
 // clients, rate_limit, rate_period, reconn_every, reconn_random, ramp_period,
 // start_delay
-static int mcslib_run(lua_State *L) {
+static int mcslib_add(lua_State *L) {
     struct mcs_ctx *ctx = *(struct mcs_ctx **)lua_getextraspace(L);
-    luaL_checktype(L, 1, LUA_TUSERDATA);
+    struct mcs_thread **threads = NULL;
+    int threadcount = 0;
+    int type = lua_type(L, 1);
+    if (type == LUA_TUSERDATA) {
+        threadcount = 1;
+        threads = calloc(threadcount, sizeof(struct mcs_thread *));
+        threads[0] = (struct mcs_thread *) lua_touserdata(L, 1);
+    } else if (type == LUA_TTABLE) {
+        lua_pushnil(L); // initialize table iteration.
+        while (lua_next(L, 1) != 0) {
+            luaL_checktype(L, -1, LUA_TUSERDATA);
+            threadcount++;
+            lua_pop(L, 1); // remove value, keep key.
+        }
+        threads = calloc(threadcount, sizeof(struct mcs_thread *));
+        // loop again to get the threads
+        lua_pushnil(L); // initialize table iteration.
+        int n = 0;
+        while (lua_next(L, 1) != 0) {
+            threads[n] = (struct mcs_thread *) lua_touserdata(L, -1);
+            n++;
+            lua_pop(L, 1); // remove value, keep key.
+        }
+
+    }
     luaL_checktype(L, 2, LUA_TTABLE);
 
-    struct mcs_thread *t = lua_touserdata(L, 1);
     int clients = 1;
     int limit = 0;
     struct mcs_f_rate frate = {0};
     struct mcs_f_reconn freconn = {0};
 
     if (lua_getfield(L, 2, "clients") != LUA_TNIL) {
-        clients = lua_tointeger(L, -1);
+        clients = lua_tointeger(L, -1) / threadcount;
     }
     lua_pop(L, 1);
 
@@ -913,7 +973,7 @@ static int mcslib_run(lua_State *L) {
     frate.rate = clients;
 
     if (lua_getfield(L, 2, "rate_limit") != LUA_TNIL) {
-        frate.rate = lua_tointeger(L, -1);
+        frate.rate = lua_tointeger(L, -1) / threadcount;
         frate.period = NSEC_PER_SEC; // default is rate per second.
     }
     lua_pop(L, 1);
@@ -931,7 +991,7 @@ static int mcslib_run(lua_State *L) {
     lua_pop(L, 1);
 
     if (lua_getfield(L, 2, "limit") != LUA_TNIL) {
-        limit = lua_tointeger(L, -1);
+        limit = lua_tointeger(L, -1) / threadcount;
     }
     lua_pop(L, 1);
 
@@ -949,56 +1009,31 @@ static int mcslib_run(lua_State *L) {
         start_rate = frate.period / clients;
     }
 
-    for (int x = 0; x < clients; x++) {
-        // create coroutine using thread VM.
-        struct mcs_func *f = lua_newuserdatauv(t->L, sizeof(struct mcs_func), 0);
-        memset(f, 0, sizeof(struct mcs_func));
-        STAILQ_INSERT_TAIL(&t->funcs, f, next);
-        t->active_funcs++;
+    const char *fname = NULL;
+    if (lua_getfield(L, 2, "func") != LUA_TNIL) {
+        fname = lua_tostring(L, -1);
+    }
+    lua_pop(L, 1);
 
-        f->parent = t;
+    for (int i = 0; i < threadcount; i++) {
+        struct mcs_thread *t = threads[i];
+        for (int x = 0; x < clients; x++) {
+            struct mcs_func *f = mcs_add_func(t);
 
-        // prepare the function's coroutine
-        lua_newthread(t->L);
-        lua_State *Lc = lua_tothread(t->L, -1);
-        f->L = Lc;
-        // pops thread
-        f->self_ref_coro = luaL_ref(t->L, LUA_REGISTRYINDEX);
-        // pop the func
-        f->self_ref = luaL_ref(t->L, LUA_REGISTRYINDEX);
-
-        // pull data from table into *f
-        if (lua_getfield(L, 2, "func") != LUA_TNIL) {
-            const char *fname = lua_tostring(L, -1);
+            // pull data from table into *f
             f->fname = strdup(fname);
+
+            f->rate = frate;
+            if (start_rate != 0) {
+                uint64_t start_offset = start_rate * x;
+                f->rate.start.tv_sec = start_offset / NSEC_PER_SEC;
+                f->rate.start.tv_nsec = start_offset - (f->rate.start.tv_sec * NSEC_PER_SEC);
+            }
+            f->reconn = freconn;
+            f->limit = limit;
+
+            memcpy(&f->conn, &ctx->conn, sizeof(f->conn));
         }
-        lua_pop(L, 1);
-
-        f->rate = frate;
-        if (start_rate != 0) {
-            uint64_t start_offset = start_rate * x;
-            f->rate.start.tv_sec = start_offset / NSEC_PER_SEC;
-            f->rate.start.tv_nsec = start_offset - (f->rate.start.tv_sec * NSEC_PER_SEC);
-        }
-        f->reconn = freconn;
-        f->limit = limit;
-
-        memcpy(&f->conn, &ctx->conn, sizeof(f->conn));
-
-        // allocate mcmc client
-        f->mcmc = calloc(1, mcmc_size(MCMC_OPTION_BLANK));
-
-        // kick off the state machine.
-        f->ev.qcb = mcs_func_run;
-        f->ev.cb = mcs_queue_cb;
-        f->ev.udata = f;
-        f->state = mcs_fstate_disconn;
-
-        f->wbuf = malloc(WBUF_INITIAL_SIZE);
-        f->wbuf_size = WBUF_INITIAL_SIZE;
-
-        f->rbuf = malloc(RBUF_INITIAL_SIZE);
-        f->rbuf_size = RBUF_INITIAL_SIZE;
     }
 
     return 0;
@@ -1303,7 +1338,8 @@ static int mcslib_ma(lua_State *L) {
 static void register_lua_libs(lua_State *L) {
     const struct luaL_Reg mcs_f [] = {
         {"thread", mcslib_thread},
-        {"run", mcslib_run},
+        {"add", mcslib_add},
+        {"run", mcslib_add}, // FIXME: remove this in a week.
         {"shredder", mcslib_shredder},
         // func functions.
         {"write", mcslib_write},

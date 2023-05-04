@@ -25,15 +25,18 @@ function config()
     -- default 1000 (one second)
     -- reconn_every: force the client to reconnect every N requests.
     -- limit: number of times to run each function for each client
-    mcs.run(t1, { func = "metaget", clients = 5, rate_limit = 100 })
+    mcs.add(t1, { func = "metaget", clients = 5, rate_limit = 100 })
     -- Multiple workloads can run on the same OS thread.
-    -- mcs.run(t1, { func = "toast", clients = 5 })
+    -- mcs.add(t1, { func = "toast", clients = 5 })
+    -- Multiple threads may be passed in at once. The client count and rate
+    -- will be divided across the threads
+    -- mcs.add({t1, t2, t3}, { etc })
 
     -- Optionally, we can create more threads in order to scale workloads.
     local t2 = mcs.thread()
     -- mcs.run(t2, { func = "basic", clients = 25, rate_limit = 10000 })
     -- watch stats output from another thread
-    mcs.run(t2, { func = "statsample", clients = 1, rate_limit = 1, period = 2000 })
+    mcs.add(t2, { func = "statsample", clients = 1, rate_limit = 1, period = 2000 })
 
     -- Run the test for 10 seconds.
     -- If no argument passed, wait for a kill or stop signal.
