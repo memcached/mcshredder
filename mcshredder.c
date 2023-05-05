@@ -145,6 +145,7 @@ struct mcs_func {
     lua_State *L; // lua coroutine local to this function
     int self_ref; // avoid garbage collection
     int self_ref_coro; // reference for the coroutine thread
+    int arg_ref; // reference for function argument
     STAILQ_ENTRY(mcs_func) next; // coroutine stack
     struct mcs_thread *parent; // pointer back to owner thread
     char *fname; // name of function to call
@@ -764,6 +765,10 @@ static int mcs_func_lua(struct mcs_func *f) {
                 exit(EXIT_FAILURE);
             }
             f->lua_nargs = 0;
+            if (f->arg_ref) {
+                lua_rawgeti(f->L, LUA_REGISTRYINDEX, f->arg_ref);
+                f->lua_nargs = 1;
+            }
             // fall through to YIELD case.
         case LUA_YIELD:
             status = lua_resume(f->L, NULL, f->lua_nargs, &nresults);
@@ -924,7 +929,57 @@ static struct mcs_func *mcs_add_func(struct mcs_thread *t) {
     return f;
 }
 
-// takes mcsthread, table
+static void _mcs_copy_table(lua_State *from, lua_State *to);
+static void _mcs_copy_table(lua_State *from, lua_State *to) {
+    int type = lua_type(from, -1);
+    switch (type) {
+        case LUA_TNIL:
+            lua_pushnil(to);
+            break;
+        case LUA_TUSERDATA:
+            // FIXME: error.
+            break;
+        case LUA_TNUMBER:
+            if (lua_isinteger(from, -1)) {
+                lua_pushinteger(to, lua_tointeger(from, -1));
+            } else {
+                lua_pushnumber(to, lua_tonumber(from, -1));
+            }
+            break;
+        case LUA_TSTRING:
+            lua_pushlstring(to, lua_tostring(from, -1), lua_rawlen(from, -1));
+            break;
+        case LUA_TTABLE:
+            lua_newtable(to);
+            int t = lua_absindex(from, -1); // static index of from table.
+            int nt = lua_absindex(to, -1); // static index of new table.
+            lua_pushnil(from); // start iterator for main
+            while (lua_next(from, t) != 0) {
+                int keytype = lua_type(from, -2);
+                switch (keytype) {
+                    case LUA_TNUMBER:
+                        if (lua_isinteger(from, -2)) {
+                            lua_pushinteger(to, lua_tointeger(from, -2));
+                        } else {
+                            lua_pushnumber(to, lua_tonumber(from, -2));
+                        }
+                        break;
+                    case LUA_TSTRING:
+                        lua_pushlstring(to, lua_tostring(from, -2), lua_rawlen(from, -2));
+                        break;
+                    default:
+                        // TODO: error
+                        break;
+                }
+                _mcs_copy_table(from, to); // recurse.
+                lua_settable(to, nt);
+                lua_pop(from, 1); // drop value, keep key.
+            }
+            break;
+    }
+}
+
+// takes mcsthread, table, [passthru argument value]
 // or table of mcsthread, table
 // configures thread.
 // arguments:
@@ -935,6 +990,7 @@ static int mcslib_add(lua_State *L) {
     struct mcs_thread **threads = NULL;
     int threadcount = 0;
     int type = lua_type(L, 1);
+    int arg_type = lua_type(L, 3);
     if (type == LUA_TUSERDATA) {
         threadcount = 1;
         threads = calloc(threadcount, sizeof(struct mcs_thread *));
@@ -1017,8 +1073,19 @@ static int mcslib_add(lua_State *L) {
 
     for (int i = 0; i < threadcount; i++) {
         struct mcs_thread *t = threads[i];
+        int arg = 0;
+        if (arg_type != LUA_TNONE) {
+            // expects argument table to be in slot -1.
+            _mcs_copy_table(L, t->L);
+            arg = lua_absindex(t->L, -1);
+        }
         for (int x = 0; x < clients; x++) {
             struct mcs_func *f = mcs_add_func(t);
+
+            if (arg) {
+                lua_pushvalue(t->L, arg);
+                f->arg_ref = luaL_ref(t->L, LUA_REGISTRYINDEX);
+            }
 
             // pull data from table into *f
             f->fname = strdup(fname);
@@ -1033,6 +1100,9 @@ static int mcslib_add(lua_State *L) {
             f->limit = limit;
 
             memcpy(&f->conn, &ctx->conn, sizeof(f->conn));
+        }
+        if (arg) {
+            lua_pop(t->L, 1);
         }
     }
 

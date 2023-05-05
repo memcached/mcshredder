@@ -31,6 +31,12 @@ function config()
     -- Multiple threads may be passed in at once. The client count and rate
     -- will be divided across the threads
     -- mcs.add({t1, t2, t3}, { etc })
+    -- arguments may be passed to functions as well:
+    -- mcs.add(t1, { options }, "argument")
+    -- mcs.add(t1, { options }, 5)
+    -- mcs.add(t1, { options }, { key = "value", more = 5 })
+    -- If used, will be passed in as the sole argument to the function
+    -- Do not use complex data structures for arguments! Will hurt speed
 
     -- Optionally, we can create more threads in order to scale workloads.
     local t2 = mcs.thread()
@@ -56,6 +62,12 @@ function warm()
     mcs.flush()
     local res = mcs.read()
     counter = counter + 1
+end
+
+function argumented(arg)
+    -- arg can be string, number, or table
+    -- note that the argument is shared with all functions created at the same
+    -- time, so do not modify the argument if it is a table!
 end
 
 function basic()
