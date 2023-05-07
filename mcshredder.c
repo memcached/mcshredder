@@ -189,6 +189,7 @@ struct mcs_ctx {
     pthread_cond_t wait_cond; // thread completion signal
     pthread_mutex_t wait_lock;
     int active_threads; // return from shredder() if threads stopped
+    int arg_ref; // commandline argument table
     const char *conffile;
     struct mcs_conn conn; // connection details.
 };
@@ -1435,6 +1436,29 @@ static void register_lua_libs(lua_State *L) {
     lua_setglobal(L, "mcs"); // set lib table to global
 }
 
+// Splits an argument list into a lua table. Table is later passed into the
+// config function.
+static int _set_arguments(lua_State *L, const char *arg) {
+    char *argcopy = strdup(arg); // copy arg to avoid editing commandline
+    lua_newtable(L); // -> table
+    char *b = NULL;
+    for (char *p = strtok_r(argcopy, ",", &b);
+            p != NULL;
+            p = strtok_r(NULL, ",", &b)) {
+        char *e =  NULL;
+        char *name = strtok_r(p, "=", &e);
+        lua_pushstring(L, name); // table -> key
+        char *value = strtok_r(NULL, "=", &e);
+        if (value == NULL) {
+            lua_pushboolean(L, 1); // table -> key -> True
+        } else {
+            lua_pushstring(L, value); // table -> key -> value
+        }
+        lua_settable(L, 1); // -> table
+    }
+    return luaL_ref(L, LUA_REGISTRYINDEX);
+}
+
 int main(int argc, char **argv) {
     const char *conffile = NULL;
     struct mcs_conn conn = {.host = "127.0.0.1", .port_num = "11211"};
@@ -1444,13 +1468,31 @@ int main(int argc, char **argv) {
         // connect to unix socket instead
         {"sock", required_argument, 0, 's'},
         {"conf", required_argument, 0, 'c'},
+        {"arg", required_argument, 0, 'a'},
         // end
         {0, 0, 0, 0}
     };
     int optindex;
     int c;
+
+    struct mcs_ctx *ctx = calloc(1, sizeof(struct mcs_ctx));
+    memcpy(&ctx->conn, &conn, sizeof(conn));
+    pthread_mutex_init(&ctx->wait_lock, NULL);
+    pthread_cond_init(&ctx->wait_cond, NULL);
+
+    // - create main VM
+    lua_State *L = luaL_newstate();
+    ctx->L = L;
+    struct mcs_ctx **extra = lua_getextraspace(L);
+    *extra = ctx;
+    luaL_openlibs(L);
+    register_lua_libs(L);
+
     while (-1 != (c = getopt_long(argc, argv, "", longopts, &optindex))) {
         switch (c) {
+        case 'a':
+            ctx->arg_ref = _set_arguments(L, optarg);
+            break;
         case 'i':
             strncpy(conn.host, optarg, NI_MAXHOST);
             break;
@@ -1470,19 +1512,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    struct mcs_ctx *ctx = calloc(1, sizeof(struct mcs_ctx));
-    memcpy(&ctx->conn, &conn, sizeof(conn));
-    pthread_mutex_init(&ctx->wait_lock, NULL);
-    pthread_cond_init(&ctx->wait_cond, NULL);
-
-    // - create main VM
-    lua_State *L = luaL_newstate();
-    ctx->L = L;
     ctx->conffile = conffile;
-    struct mcs_ctx **extra = lua_getextraspace(L);
-    *extra = ctx;
-    luaL_openlibs(L);
-    register_lua_libs(L);
 
     if (conffile == NULL) {
         fprintf(stderr, "Must provide a config file: --conf etc.lua\n");
@@ -1502,7 +1532,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Configuration missing 'config' function\n");
         exit(EXIT_FAILURE);
     }
-    if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+
+    if (ctx->arg_ref) {
+        lua_rawgeti(L, LUA_REGISTRYINDEX, ctx->arg_ref);
+    } else {
+        lua_newtable(L);
+    }
+    if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
         fprintf(stderr, "Failed to execute config function: %s\n", lua_tostring(L, -1));
         exit(EXIT_FAILURE);
     }

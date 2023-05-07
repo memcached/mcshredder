@@ -1,14 +1,24 @@
 -- First the "config()" function is called,
 -- which configures thread objects, attaches workloads to thread objects, then
 -- runs the test.
-function config()
+-- arguments can be passed from the command line via:
+-- --args warm,rate=5000
+function config(args)
     -- example of calling mcs.shredder() multiple times to create a
     -- pre-warming function
-    print("starting pre-warm")
-    local warm = mcs.thread()
-    mcs.run(warm, { func = "warm", clients = 1, limit = 1000 })
-    mcs.shredder({warm}, 30) -- wait up to 30 seconds for warmer to run
-    print("warming completed")
+    if args["warm"] ~= nil then
+        print("starting pre-warm")
+        local warm = mcs.thread()
+        mcs.run(warm, { func = "warm", clients = 1, limit = 1000 })
+        mcs.shredder({warm}, 30) -- wait up to 30 seconds for warmer to run
+        print("warming completed")
+    end
+
+    local rate = 100
+    if args["rate"] ~= nil then
+        rate = args["rate"]
+        print("overriding rate from command line: " .. rate)
+    end
 
     print("starting test")
     -- Create a dedicated OS thread
@@ -25,7 +35,7 @@ function config()
     -- default 1000 (one second)
     -- reconn_every: force the client to reconnect every N requests.
     -- limit: number of times to run each function for each client
-    mcs.add(t1, { func = "metaget", clients = 5, rate_limit = 100 })
+    mcs.add(t1, { func = "metaget", clients = 5, rate_limit = rate })
     -- Multiple workloads can run on the same OS thread.
     -- mcs.add(t1, { func = "toast", clients = 5 })
     -- Multiple threads may be passed in at once. The client count and rate
