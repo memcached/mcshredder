@@ -1459,8 +1459,21 @@ static int _set_arguments(lua_State *L, const char *arg) {
     return luaL_ref(L, LUA_REGISTRYINDEX);
 }
 
+static void usage(struct mcs_ctx *ctx) {
+    printf("usage:\n"
+           "--ip=<addr> (127.0.0.1): IP to connect to\n"
+           "--port=<port> (11211): Port to connect to\n"
+           "--conf=<file> (none): Lua configuration file\n"
+           "--arg=<key,key=val,key2=val2> (none): arguments to pass to config script\n"
+          );
+    lua_getglobal(ctx->L, "help");
+    if (!lua_isnil(ctx->L, -1)) {
+        printf("usage from config file:\n");
+        lua_pcall(ctx->L, 0, 0, 0);
+    }
+}
+
 int main(int argc, char **argv) {
-    const char *conffile = NULL;
     struct mcs_conn conn = {.host = "127.0.0.1", .port_num = "11211"};
     const struct option longopts[] = {
         {"ip", required_argument, 0, 'i'},
@@ -1469,6 +1482,7 @@ int main(int argc, char **argv) {
         {"sock", required_argument, 0, 's'},
         {"conf", required_argument, 0, 'c'},
         {"arg", required_argument, 0, 'a'},
+        {"help", no_argument, 0, 'h'},
         // end
         {0, 0, 0, 0}
     };
@@ -1504,7 +1518,15 @@ int main(int argc, char **argv) {
             return EXIT_FAILURE;
             break;
         case 'c':
-            conffile = strdup(optarg);
+            ctx->conffile = strdup(optarg);
+            if (luaL_dofile(L, ctx->conffile) != LUA_OK) {
+                fprintf(stderr, "Failed to load config file: %s\n", lua_tostring(L, -1));
+                exit(EXIT_FAILURE);
+            }
+            break;
+        case 'h':
+            usage(ctx);
+            return EXIT_SUCCESS;
             break;
         default:
             fprintf(stderr, "Unknown option\n");
@@ -1512,19 +1534,11 @@ int main(int argc, char **argv) {
         }
     }
 
-    ctx->conffile = conffile;
-
-    if (conffile == NULL) {
+    if (ctx->conffile == NULL) {
         fprintf(stderr, "Must provide a config file: --conf etc.lua\n");
         exit(EXIT_FAILURE);
     }
 
-    // - load config file
-    int res = luaL_dofile(L, conffile);
-    if (res != LUA_OK) {
-        fprintf(stderr, "Failed to load config file: %s\n", lua_tostring(L, -1));
-        exit(EXIT_FAILURE);
-    }
     // - call "config" global cmd
     lua_getglobal(L, "config");
 

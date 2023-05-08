@@ -60,6 +60,10 @@ function config(args)
     print("done")
 end
 
+function help()
+    print("extra argument explanations here")
+end
+
 -- we use a global counter here, note that any global variable will be local
 -- to each OS thread created, as each OS thread uses an independent lua VM
 -- loading this same code.
