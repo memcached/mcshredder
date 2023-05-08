@@ -416,6 +416,7 @@ static int mcs_connect(struct mcs_func *f) {
     int status = mcmc_connect(f->mcmc, f->conn.host, f->conn.port_num, MCMC_OPTION_NONBLOCK);
     if (status == MCMC_CONNECTED) {
         // NOTE: find when this is possible?
+        fprintf(stderr, "Client connected unexpectedly, please report this\n");
         abort();
     } else if (status == MCMC_CONNECTING) {
         // need to wait for a writeable event.
@@ -446,6 +447,7 @@ void mcs_postflush(struct mcs_func *f) {
         if (res == -EAGAIN || res == -EWOULDBLOCK) {
             // TODO: -> wrpoll -> flush
             // is this even possible with uring?
+            fprintf(stderr, "Unexpectedly could not write to socket: please report this\n");
             abort();
         } else {
             f->reserr = res;
@@ -466,7 +468,7 @@ static int mcs_read_buf(struct mcs_func *f) {
     // optimistically allocate a response to minimize data copying.
     struct mcs_func_resp *r = lua_newuserdatauv(f->L, sizeof(struct mcs_func_resp), 0);
     memset(r, 0, sizeof(*r));
-    r->status = mcmc_parse_buf(f->mcmc, f->rbuf, f->rbuf_used, &r->resp);
+    r->status = mcmc_parse_buf(f->rbuf, f->rbuf_used, &r->resp);
     if (r->status == MCMC_OK) {
         if (r->resp.vlen != r->resp.vlen_read) {
             lua_pop(f->L, 1); // throw away the resp object, try re-parsing later
@@ -485,9 +487,21 @@ static int mcs_read_buf(struct mcs_func *f) {
         mcs_expand_rbuf(f);
         f->state = mcs_fstate_read;
     } else {
-        // TODO: real error.
-        fprintf(stderr, "Buffer read failed with bad response, exiting: %.*s\n", f->rbuf_used, f->rbuf);
-        abort();
+        switch (r->resp.type) {
+            case MCMC_RESP_ERRMSG:
+                if (r->resp.code != MCMC_CODE_SERVER_ERROR) {
+                    fprintf(stderr, "Protocol error, reconnecting: %.*s\n", f->rbuf_used, f->rbuf);
+                    return -1;
+                }
+                break;
+            case MCMC_RESP_FAIL:
+                fprintf(stderr, "Read failed, reconnecting: %.*s\n", f->rbuf_used, f->rbuf);
+                return -1;
+                break;
+            default:
+                fprintf(stderr, "Read found garbage, reconnecting: %.*s\n", f->rbuf_used, f->rbuf);
+                return -1;
+        }
     }
 
     return 0;
@@ -498,11 +512,15 @@ static void mcs_postread(struct mcs_func *f) {
 
     if (res > 0) {
         f->rbuf_used += res;
-        mcs_read_buf(f);
+        if (mcs_read_buf(f) != 0) {
+            f->reserr = 1;
+            f->state = mcs_fstate_syserr;
+        }
     } else if (res < 0) {
         if (res == -EAGAIN || res == -EWOULDBLOCK) {
             // TODO: I think we should never get here, as uring is supposed to
             // only wake us up with data filled.
+            fprintf(stderr, "Unexpectedly could not read from socket, please report this\n");
             abort();
         } else {
             f->reserr = 0;
@@ -542,6 +560,7 @@ static void mcs_syserror(struct mcs_func *f) {
     int res = lua_resetthread(f->L);
     if (res != LUA_OK) {
         // TODO: read lua code to find potential errors.
+        fprintf(stderr, "Lua thread failed to reset, aborting\n");
         abort();
     }
 
@@ -662,6 +681,7 @@ static int mcs_func_run(void *udata) {
             stop = true;
             break;
         default:
+            fprintf(stderr, "Unhandled function state, aborting\n");
             abort();
     }
     }
@@ -749,6 +769,7 @@ static int mcs_func_lua_yield(struct mcs_func *f, int nresults) {
             res = mcslib_read_c(f);
             break;
         default:
+            fprintf(stderr, "Unhandled yield state, aborting\n");
             abort();
     }
     return res;
@@ -785,6 +806,7 @@ static int mcs_func_lua(struct mcs_func *f) {
             break;
         default:
             // if not OK or YIELD it's some kind of error state.
+            fprintf(stderr, "Lua thread yielded an unexpected error, aborting\n");
             abort();
             break;
     }
@@ -799,6 +821,7 @@ static void mcs_start_limiter(struct mcs_func *f) {
 
     int res = clock_gettime(CLOCK_MONOTONIC, &ts);
     if (res != 0) {
+        fprintf(stderr, "Failed to get monotonic clock, aborting\n");
         abort();
     }
 
