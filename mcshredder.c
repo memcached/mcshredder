@@ -54,6 +54,9 @@
 
 #define NSEC_PER_SEC 1000000000
 
+#define PARSER_MAX_TOKENS 24
+#define PARSER_MAXLEN USHRT_MAX-1
+
 char sock_path_default[SOCK_MAX];
 
 // TODO: This is a global timeout just to get code started.
@@ -136,9 +139,11 @@ struct mcs_func_req {
 // points into func's rbuf
 struct mcs_func_resp {
     int status;
+    int ntokens; // zero if not tokenized
     struct timespec received; // time response was read from socket
     char *buf; // start of response buffer
     mcmc_resp_t resp;
+    uint16_t tokens[PARSER_MAX_TOKENS]; // offsets for start of each token
 };
 
 struct mcs_func {
@@ -1224,6 +1229,73 @@ static int mcslib_shredder(lua_State *L) {
     return 0;
 }
 
+static int _tokenize(struct mcs_func_resp *r) {
+    const char *s = r->buf;
+    int len = r->resp.reslen - 2;
+    int max = PARSER_MAX_TOKENS;
+
+    if (len > PARSER_MAXLEN) {
+        len = PARSER_MAXLEN;
+    }
+
+    const char *end = s + len;
+    int curtoken = 0; // token 0 always starts at 0.
+
+    int state = 0;
+    while (s != end) {
+        switch (state) {
+            case 0:
+                // scanning for first non-space to find a token.
+                if (*s != ' ') {
+                    r->tokens[curtoken] = s - r->buf;
+                    if (++curtoken == max) {
+                        s++;
+                        state = 2;
+                        break;
+                    }
+                    state = 1;
+                }
+                s++;
+                break;
+            case 1:
+                // advance over a token
+                if (*s != ' ') {
+                    s++;
+                } else {
+                    state = 0;
+                }
+                break;
+            case 2:
+                // hit max tokens before end of the line.
+                // keep advancing so we can place endcap token.
+                if (*s == ' ') {
+                    goto endloop;
+                }
+                s++;
+                break;
+        }
+    }
+endloop:
+
+    // endcap token so we can quickly find the length of any token by looking
+    // at the next one.
+    r->tokens[curtoken] = s - r->buf;
+    r->ntokens = curtoken;
+
+    return 0;
+
+}
+
+static int _token_len(struct mcs_func_resp *r, int token) {
+    const char *s = r->buf + r->tokens[token];
+    const char *e = r->buf + r->tokens[token+1];
+    // start of next token is after any space delimiters, so back those out.
+    while (*(e-1) == ' ') {
+        e--;
+    }
+    return e - s;
+}
+
 // TODO: minimal argument validation?
 // since this is a benchmark tool we should attempt to minmax, and argument
 // checking does take measurable time.
@@ -1249,6 +1321,46 @@ static int mcslib_resline(lua_State *L) {
         len -= 2;
     }
     lua_pushlstring(L, r->buf, len);
+    return 1;
+}
+
+static int mcslib_res_ntokens(lua_State *L) {
+    struct mcs_func_resp *r = lua_touserdata(L, -1);
+    if (!r->ntokens) {
+        _tokenize(r);
+    }
+    lua_pushinteger(L, r->ntokens-1);
+    return 1;
+}
+
+static int mcslib_res_token(lua_State *L) {
+    struct mcs_func_resp *r = lua_touserdata(L, -2);
+    int n = lua_tointeger(L, -1) - 1; // keep lua array semantics. 1 index.
+    if (!r->ntokens) {
+        _tokenize(r);
+    }
+
+    if (n >= r->ntokens) {
+        // TODO: error, maybe?
+        return 0;
+    }
+
+    int len = _token_len(r, n);
+    lua_pushlstring(L, r->buf + r->tokens[n], len);
+    return 1;
+}
+
+static int mcslib_res_split(lua_State *L) {
+    struct mcs_func_resp *r = lua_touserdata(L, -1);
+    if (!r->ntokens) {
+        _tokenize(r);
+    }
+    lua_newtable(L);
+    for (int x = 0; x < r->ntokens; x++) {
+        lua_pushlstring(L, r->buf + r->tokens[x], _token_len(r, x));
+        lua_rawseti(L, -2, x+1); // lua arrays are 1 indexed.
+    }
+
     return 1;
 }
 
@@ -1445,6 +1557,9 @@ static void register_lua_libs(lua_State *L) {
         {"read", mcslib_read},
         // object functions.
         {"resline", mcslib_resline},
+        {"res_ntokens", mcslib_res_ntokens},
+        {"res_token", mcslib_res_token},
+        {"res_split", mcslib_res_split},
         {"res_stat", mcslib_res_stat},
         {"res_statname", mcslib_res_statname},
         {"match", mcslib_match},
