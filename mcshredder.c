@@ -1244,7 +1244,11 @@ static int mcslib_read(lua_State *L) {
 
 static int mcslib_resline(lua_State *L) {
     struct mcs_func_resp *r = lua_touserdata(L, -1);
-    lua_pushlstring(L, r->buf, r->resp.reslen);
+    size_t len = r->resp.reslen;
+    if (r->buf[len-2] == '\r' && r->buf[len-1] == '\n') {
+        len -= 2;
+    }
+    lua_pushlstring(L, r->buf, len);
     return 1;
 }
 

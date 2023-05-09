@@ -102,7 +102,7 @@ function basic()
     -- every time read() is called.
     --
     -- check if we had a miss.
-    if mcs.resline(res) == "END\r\n" then
+    if mcs.resline(res) == "END" then
         -- similar to above, but create a set backfill
         local set = mcs.set("toast/", num, 0, 90, 100)
         mcs.write(set)
@@ -122,7 +122,7 @@ function metaget()
     mcs.write(req)
     mcs.flush()
     local res = mcs.read()
-    if mcs.resline(res) == "EN\r\n" then
+    if mcs.resline(res) == "EN" then
         local set = mcs.ms("toast/", num, "T90", 50)
         mcs.write(set)
         mcs.flush()
@@ -163,7 +163,7 @@ function statsample()
     local stats = {}
     while true do
         local res = mcs.read()
-        if mcs.resline(res) == "END\r\n" then
+        if mcs.resline(res) == "END" then
             break
         end
         stats[mcs.res_statname(res)] = mcs.res_stat(res)
