@@ -1364,6 +1364,70 @@ static int mcslib_res_split(lua_State *L) {
     return 1;
 }
 
+static int mcslib_res_hasflag(lua_State *L) {
+    struct mcs_func_resp *r = lua_touserdata(L, -2);
+    size_t len = 0;
+    const char *flag = lua_tolstring(L, -1, &len);
+    if (!r->ntokens) {
+        _tokenize(r);
+    }
+
+    int start = 1; // index of first flag
+    int found = 0;
+    if (r->resp.vlen != 0) {
+        start = 2; // skip past VA [len]
+    }
+    for (int x = start; x < r->ntokens; x++) {
+        if (r->buf[r->tokens[x]] == flag[0]) {
+            found = 1;
+            break;
+        }
+    }
+
+    if (found) {
+        lua_pushboolean(L, 1);
+    } else {
+        lua_pushboolean(L, 0);
+    }
+    return 1;
+}
+
+static int mcslib_res_flagtoken(lua_State *L) {
+    struct mcs_func_resp *r = lua_touserdata(L, -2);
+    size_t len = 0;
+    const char *flag = lua_tolstring(L, -1, &len);
+    if (!r->ntokens) {
+        _tokenize(r);
+    }
+
+    int x = 1; // index of first flag
+    char *token = NULL;
+    int tlen = 0;
+    if (r->resp.vlen != 0) {
+        x = 2; // skip past VA [len]
+    }
+    for (; x < r->ntokens; x++) {
+        if (r->buf[r->tokens[x]] == flag[0]) {
+            token = r->buf + r->tokens[x];
+            tlen = _token_len(r, x);
+            break;
+        }
+    }
+
+    if (token) {
+        lua_pushboolean(L, 1);
+        if (tlen > 1) {
+            lua_pushlstring(L, token+1, tlen-1);
+            return 2;
+        } else {
+            return 1;
+        }
+    } else {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+}
+
 static int mcslib_res_statname(lua_State *L) {
     struct mcs_func_resp *r = lua_touserdata(L, -1);
     lua_pushlstring(L, r->resp.sname, r->resp.snamelen);
@@ -1560,6 +1624,8 @@ static void register_lua_libs(lua_State *L) {
         {"res_ntokens", mcslib_res_ntokens},
         {"res_token", mcslib_res_token},
         {"res_split", mcslib_res_split},
+        {"res_hasflag", mcslib_res_hasflag},
+        {"res_flagtoken", mcslib_res_flagtoken},
         {"res_stat", mcslib_res_stat},
         {"res_statname", mcslib_res_statname},
         {"match", mcslib_match},
