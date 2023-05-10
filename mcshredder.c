@@ -1456,6 +1456,10 @@ static int mcslib_match(lua_State *L) {
     return 2;
 }
 
+// TODO:
+// do I care enough about cas/gets/gat/etc? I don't think so? maybe not right
+// this moment.
+
 // get(prefix, number)
 static int mcslib_get(lua_State *L) {
     struct mcs_func_req *req = lua_newuserdatauv(L, sizeof(struct mcs_func_req) + REQ_MAX_LENGTH, 0);
@@ -1471,7 +1475,70 @@ static int mcslib_get(lua_State *L) {
 
     int num = lua_tointeger(L, 2);
 
-    p = itoa_32(num, p);
+    if (num > -1) {
+        p = itoa_32(num, p);
+    }
+
+    memcpy(p, "\r\n", 2);
+    p += 2;
+
+    req->len = p - req->data;
+    req->vlen = 0;
+
+    return 1;
+}
+
+// delete(prefix, number)
+static int mcslib_delete(lua_State *L) {
+    struct mcs_func_req *req = lua_newuserdatauv(L, sizeof(struct mcs_func_req) + REQ_MAX_LENGTH, 0);
+
+    size_t len = 0;
+    const char *pfx = lua_tolstring(L, 1, &len);
+
+    char *p = req->data;
+    memcpy(p, "delete ", 7);
+    p += 4;
+    memcpy(p, pfx, len);
+    p += len;
+
+    int num = lua_tointeger(L, 2);
+
+    if (num > -1) {
+        p = itoa_32(num, p);
+    }
+
+    memcpy(p, "\r\n", 2);
+    p += 2;
+
+    req->len = p - req->data;
+    req->vlen = 0;
+
+    return 1;
+}
+
+// touch(prefix, number, ttl)
+static int mcslib_touch(lua_State *L) {
+    struct mcs_func_req *req = lua_newuserdatauv(L, sizeof(struct mcs_func_req) + REQ_MAX_LENGTH, 0);
+
+    size_t len = 0;
+    const char *pfx = lua_tolstring(L, 1, &len);
+
+    char *p = req->data;
+    memcpy(p, "touch ", 6);
+    p += 4;
+    memcpy(p, pfx, len);
+    p += len;
+
+    int num = lua_tointeger(L, 2);
+
+    if (num > -1) {
+        p = itoa_32(num, p);
+    }
+
+    int ttl = lua_tointeger(L, 3);
+    *p = ' ';
+    p++;
+    p = itoa_32(ttl, p);
 
     memcpy(p, "\r\n", 2);
     p += 2;
@@ -1498,7 +1565,9 @@ static int mcslib_set(lua_State *L) {
 
     int num = lua_tointeger(L, 2);
 
-    p = itoa_32(num, p);
+    if (num > -1) {
+        p = itoa_32(num, p);
+    }
     *p = ' ';
     p++;
 
@@ -1523,8 +1592,12 @@ static int mcslib_set(lua_State *L) {
     return 1;
 }
 
+// new: prefix, number, vlen, flag, flag, etc
+// if -1 passed as num, do not append number
+// flag can be a set "a b c" or "a", "b", "C400" individually
 static int mcslib_ms(lua_State *L) {
     struct mcs_func_req *req = lua_newuserdatauv(L, sizeof(struct mcs_func_req) + REQ_MAX_LENGTH, 0);
+    int argc = lua_gettop(L);
 
     size_t len = 0;
     const char *pfx = lua_tolstring(L, 1, &len);
@@ -1537,19 +1610,23 @@ static int mcslib_ms(lua_State *L) {
 
     int num = lua_tointeger(L, 2);
 
-    p = itoa_32(num, p);
+    if (num > -1) {
+        p = itoa_32(num, p);
+    }
     *p = ' ';
     p++;
 
     req->vlen = lua_tointeger(L, 4);
     p = itoa_32(req->vlen, p);
 
-    const char *flags = lua_tolstring(L, 3, &len);
-    if (len) {
-        *p = ' ';
-        p++;
-        memcpy(p, flags, len);
-        p += len;
+    for (int x = 3; x < argc; x++) {
+        const char *flags = lua_tolstring(L, x, &len);
+        if (len) {
+            *p = ' ';
+            p++;
+            memcpy(p, flags, len);
+            p += len;
+        }
     }
 
     memcpy(p, "\r\n", 2);
@@ -1561,8 +1638,14 @@ static int mcslib_ms(lua_State *L) {
 }
 
 // TODO: automatically create and append an Opaque token for matching.
+// arguments:
+//  - key prefix
+//  - numeric to append to key. if -1 do not append anything
+//  - N arguments for flags to append. use instead of creating strings in lua
+//  first, if possible
 static int _mcslib_basic(lua_State *L, char cmd) {
     struct mcs_func_req *req = lua_newuserdatauv(L, sizeof(struct mcs_func_req) + REQ_MAX_LENGTH, 0);
+    int argc = lua_gettop(L);
 
     size_t len = 0;
     const char *pfx = lua_tolstring(L, 1, &len);
@@ -1576,14 +1659,18 @@ static int _mcslib_basic(lua_State *L, char cmd) {
 
     int num = lua_tointeger(L, 2);
 
-    p = itoa_32(num, p);
+    if (num > -1) {
+        p = itoa_32(num, p);
+    }
 
-    const char *flags = lua_tolstring(L, 3, &len);
-    if (len) {
-        *p = ' ';
-        p++;
-        memcpy(p, flags, len);
-        p += len;
+    for (int x = 3; x < argc; x++) {
+        const char *flags = lua_tolstring(L, x, &len);
+        if (len) {
+            *p = ' ';
+            p++;
+            memcpy(p, flags, len);
+            p += len;
+        }
     }
 
     memcpy(p, "\r\n", 2);
@@ -1632,6 +1719,8 @@ static void register_lua_libs(lua_State *L) {
         // request functions.
         {"get", mcslib_get},
         {"set", mcslib_set},
+        {"touch", mcslib_touch},
+        {"delete", mcslib_delete},
         {"mg", mcslib_mg},
         {"ms", mcslib_ms},
         {"md", mcslib_md},
