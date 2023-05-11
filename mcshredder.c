@@ -40,6 +40,7 @@
 #include "vendor/mcmc/mcmc.h"
 #include "queue.h"
 #include "itoa_ljust.h"
+#include "xxhash.h"
 
 #define PRING_QUEUE_SQ_ENTRIES 1024
 #define PRING_QUEUE_CQ_ENTRIES 4096
@@ -133,6 +134,7 @@ struct mcs_func_req {
     struct timespec start;
     int len;
     int vlen;
+    uint64_t hash; // hash of the key, used to match the value.
     char data[];
 };
 
@@ -1616,10 +1618,10 @@ static int mcslib_ms(lua_State *L) {
     *p = ' ';
     p++;
 
-    req->vlen = lua_tointeger(L, 4);
+    req->vlen = lua_tointeger(L, 3);
     p = itoa_32(req->vlen, p);
 
-    for (int x = 3; x < argc; x++) {
+    for (int x = 4; x < argc; x++) {
         const char *flags = lua_tolstring(L, x, &len);
         if (len) {
             *p = ' ';
@@ -1787,7 +1789,6 @@ int main(int argc, char **argv) {
     int c;
 
     struct mcs_ctx *ctx = calloc(1, sizeof(struct mcs_ctx));
-    memcpy(&ctx->conn, &conn, sizeof(conn));
     pthread_mutex_init(&ctx->wait_lock, NULL);
     pthread_cond_init(&ctx->wait_cond, NULL);
 
@@ -1831,6 +1832,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    memcpy(&ctx->conn, &conn, sizeof(conn));
     if (ctx->conffile == NULL) {
         fprintf(stderr, "Must provide a config file: --conf etc.lua\n");
         exit(EXIT_FAILURE);
