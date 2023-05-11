@@ -40,6 +40,7 @@
 #include "vendor/mcmc/mcmc.h"
 #include "queue.h"
 #include "itoa_ljust.h"
+#define XXH_INLINE_ALL
 #include "xxhash.h"
 
 #define PRING_QUEUE_SQ_ENTRIES 1024
@@ -696,15 +697,54 @@ static int mcs_func_run(void *udata) {
     return 0;
 }
 
+// Turn the 8 byte hash into a pattern-fill for the value. Just filling with
+// the same value can miss a few classes of bugs.
+static void _mcs_write_value(struct mcs_func_req *r, struct mcs_func *f) {
+    uint64_t hash = r->hash;
+    for (int x = 0; x < r->vlen / sizeof(hash); x++) {
+        memcpy(f->wbuf + f->wbuf_used, &hash, sizeof(hash));
+        hash++;
+        f->wbuf_used += sizeof(hash);
+    }
+
+    int remain = r->vlen % sizeof(hash);
+    for (int x = 0; x < remain; x++) {
+        f->wbuf[f->wbuf_used] = '#';
+        f->wbuf_used++;
+    }
+
+    memcpy(f->wbuf + f->wbuf_used, "\r\n", 2);
+    f->wbuf_used += 2;
+}
+
+// should be doing cast-comparisons since that should be a bit faster, but not
+// sure what the compiler's going to do with this to be honest.
+static int _mcs_check_value(struct mcs_func_req *req, struct mcs_func_resp *res) {
+    uint64_t hash = req->hash;
+    for (int x = 0; x < res->resp.vlen / sizeof(hash); x++) {
+        if (memcmp(res->resp.value + x * sizeof(hash), &hash, sizeof(hash)) != 0) {
+            return -1;
+        }
+        hash++;
+    }
+    // TODO: bother checking the remain? it should be fine since we can't get
+    // here without the \r\n being valid _and_ all of the key specific stuff
+    // checked.
+    //int remain = res->resp.vlen % sizeof(hash);
+
+    return 0;
+}
+
 // writes the passed argument to the client buffer
 static int mcslib_write_c(struct mcs_func *f) {
     int type = lua_type(f->L, -1);
     size_t len = 0;
     int vlen = 0;
     const char *rline = NULL;
+    struct mcs_func_req *req = NULL;
 
     if (type == LUA_TUSERDATA) {
-        struct mcs_func_req *req = lua_touserdata(f->L, -1);
+        req = lua_touserdata(f->L, -1);
         len = req->len;
         rline = req->data;
         vlen = req->vlen;
@@ -721,12 +761,7 @@ static int mcslib_write_c(struct mcs_func *f) {
     lua_pop(f->L, 1);
 
     if (vlen != 0) {
-        // TODO: write a specific pattern into the buffer.
-        memset(f->wbuf + f->wbuf_used, 35, vlen);
-        f->wbuf_used += vlen;
-
-        memcpy(f->wbuf + f->wbuf_used, "\r\n", 2);
-        f->wbuf_used += 2;
+        _mcs_write_value(req, f);
     }
     return 0;
 }
@@ -1448,9 +1483,19 @@ static int mcslib_res_stat(lua_State *L) {
 static int mcslib_match(lua_State *L) {
     struct mcs_func_req *req = lua_touserdata(L, 1);
     struct mcs_func_resp *res = lua_touserdata(L, 2);
+    int failed = 0;
 
-    // TODO: first result is always true as match checking isn't implemented
-    lua_pushboolean(L, 1);
+    if (res->resp.vlen != 0) {
+        if (_mcs_check_value(req, res) != 0) {
+            failed = 1;
+        }
+    }
+
+    if (failed) {
+        lua_pushboolean(L, 0);
+    } else {
+        lua_pushboolean(L, 1);
+    }
 
     int elapsed = (res->received.tv_sec - req->start.tv_sec) * 1000000 +
         (res->received.tv_nsec - req->start.tv_nsec) / 1000; // nano to micro
@@ -1467,11 +1512,15 @@ static int mcslib_get(lua_State *L) {
     struct mcs_func_req *req = lua_newuserdatauv(L, sizeof(struct mcs_func_req) + REQ_MAX_LENGTH, 0);
 
     size_t len = 0;
+    char *key = NULL;
+    int klen = 0;
     const char *pfx = lua_tolstring(L, 1, &len);
 
     char *p = req->data;
     memcpy(p, "get ", 4);
     p += 4;
+
+    key = p;
     memcpy(p, pfx, len);
     p += len;
 
@@ -1480,6 +1529,8 @@ static int mcslib_get(lua_State *L) {
     if (num > -1) {
         p = itoa_32(num, p);
     }
+    klen = p - key;
+    req->hash = XXH3_64bits(key, klen);
 
     memcpy(p, "\r\n", 2);
     p += 2;
@@ -1495,11 +1546,15 @@ static int mcslib_delete(lua_State *L) {
     struct mcs_func_req *req = lua_newuserdatauv(L, sizeof(struct mcs_func_req) + REQ_MAX_LENGTH, 0);
 
     size_t len = 0;
+    char *key = NULL;
+    int klen = 0;
     const char *pfx = lua_tolstring(L, 1, &len);
 
     char *p = req->data;
     memcpy(p, "delete ", 7);
     p += 4;
+
+    key = p;
     memcpy(p, pfx, len);
     p += len;
 
@@ -1508,6 +1563,8 @@ static int mcslib_delete(lua_State *L) {
     if (num > -1) {
         p = itoa_32(num, p);
     }
+    klen = p - key;
+    req->hash = XXH3_64bits(key, klen);
 
     memcpy(p, "\r\n", 2);
     p += 2;
@@ -1523,11 +1580,15 @@ static int mcslib_touch(lua_State *L) {
     struct mcs_func_req *req = lua_newuserdatauv(L, sizeof(struct mcs_func_req) + REQ_MAX_LENGTH, 0);
 
     size_t len = 0;
+    char *key = NULL;
+    int klen = 0;
     const char *pfx = lua_tolstring(L, 1, &len);
 
     char *p = req->data;
     memcpy(p, "touch ", 6);
     p += 4;
+
+    key = p;
     memcpy(p, pfx, len);
     p += len;
 
@@ -1536,6 +1597,8 @@ static int mcslib_touch(lua_State *L) {
     if (num > -1) {
         p = itoa_32(num, p);
     }
+    klen = p - key;
+    req->hash = XXH3_64bits(key, klen);
 
     int ttl = lua_tointeger(L, 3);
     *p = ' ';
@@ -1557,11 +1620,15 @@ static int mcslib_set(lua_State *L) {
     struct mcs_func_req *req = lua_newuserdatauv(L, sizeof(struct mcs_func_req) + REQ_MAX_LENGTH, 0);
 
     size_t len = 0;
+    char *key = NULL;
+    int klen = 0;
     const char *pfx = lua_tolstring(L, 1, &len);
 
     char *p = req->data;
     memcpy(p, "set ", 4);
     p += 4;
+
+    key = p;
     memcpy(p, pfx, len);
     p += len;
 
@@ -1570,6 +1637,9 @@ static int mcslib_set(lua_State *L) {
     if (num > -1) {
         p = itoa_32(num, p);
     }
+    klen = p - key;
+    req->hash = XXH3_64bits(key, klen);
+
     *p = ' ';
     p++;
 
@@ -1602,11 +1672,15 @@ static int mcslib_ms(lua_State *L) {
     int argc = lua_gettop(L);
 
     size_t len = 0;
+    char *key = NULL;
+    int klen = 0;
     const char *pfx = lua_tolstring(L, 1, &len);
 
     char *p = req->data;
     memcpy(p, "ms ", 3);
     p += 3;
+
+    key = p;
     memcpy(p, pfx, len);
     p += len;
 
@@ -1615,6 +1689,9 @@ static int mcslib_ms(lua_State *L) {
     if (num > -1) {
         p = itoa_32(num, p);
     }
+    klen = p - key;
+    req->hash = XXH3_64bits(key, klen);
+
     *p = ' ';
     p++;
 
@@ -1650,12 +1727,16 @@ static int _mcslib_basic(lua_State *L, char cmd) {
     int argc = lua_gettop(L);
 
     size_t len = 0;
+    char *key = NULL;
+    int klen = 0;
     const char *pfx = lua_tolstring(L, 1, &len);
 
     char *p = req->data;
     memcpy(p, "m  ", 3);
     p[1] = cmd;
     p += 3;
+
+    key = p;
     memcpy(p, pfx, len);
     p += len;
 
@@ -1664,6 +1745,8 @@ static int _mcslib_basic(lua_State *L, char cmd) {
     if (num > -1) {
         p = itoa_32(num, p);
     }
+    klen = p - key;
+    req->hash = XXH3_64bits(key, klen);
 
     for (int x = 3; x < argc; x++) {
         const char *flags = lua_tolstring(L, x, &len);

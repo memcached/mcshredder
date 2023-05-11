@@ -123,10 +123,15 @@ function metaget()
     mcs.flush()
     local res = mcs.read()
     if mcs.resline(res) == "EN" then
-        local set = mcs.ms("toast/", num, "T90", 50)
+        local set = mcs.ms("toast/", num, 50, "T90")
         mcs.write(set)
         mcs.flush()
         local res = mcs.read()
+    else
+        local status, elapsed = mcs.match(req, res)
+        if not status then
+            print("Result did not match request!")
+        end
     end
 end
 
