@@ -1166,7 +1166,8 @@ static int mcslib_add(lua_State *L) {
                 f->rate.start.tv_nsec = start_offset - (f->rate.start.tv_sec * NSEC_PER_SEC);
             }
             f->reconn = freconn;
-            f->limit = limit;
+            // first run counts against the limiter
+            f->limit = limit + 1;
 
             memcpy(&f->conn, &ctx->conn, sizeof(f->conn));
         }
