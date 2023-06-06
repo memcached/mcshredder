@@ -1136,6 +1136,9 @@ static int mcslib_add(lua_State *L) {
         fname = lua_tostring(L, -1);
     }
     lua_pop(L, 1);
+    if (fname == NULL) {
+        luaL_error(L, "mcs.add call missing 'func' argument");
+    }
 
     for (int i = 0; i < threadcount; i++) {
         struct mcs_thread *t = threads[i];
