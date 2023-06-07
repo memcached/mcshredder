@@ -927,6 +927,7 @@ static void *shredder_thread(void *arg) {
     }
 
     pthread_mutex_lock(&t->ctx->wait_lock);
+    t->ctx->active_threads--;
     pthread_cond_signal(&t->ctx->wait_cond);
     pthread_mutex_unlock(&t->ctx->wait_lock);
 
@@ -1114,6 +1115,7 @@ static int mcslib_add(lua_State *L) {
 
     if (lua_getfield(L, 2, "limit") != LUA_TNIL) {
         limit = lua_tointeger(L, -1) / threadcount;
+        limit++; // first run counts against the limiter.
     }
     lua_pop(L, 1);
 
@@ -1167,7 +1169,7 @@ static int mcslib_add(lua_State *L) {
             }
             f->reconn = freconn;
             // first run counts against the limiter
-            f->limit = limit + 1;
+            f->limit = limit;
 
             memcpy(&f->conn, &ctx->conn, sizeof(f->conn));
         }
@@ -1253,7 +1255,6 @@ static int mcslib_shredder(lua_State *L) {
         } else {
             pthread_cond_wait(&ctx->wait_cond, &ctx->wait_lock);
         }
-        ctx->active_threads--;
         if (ctx->active_threads == 0) {
             pthread_mutex_unlock(&ctx->wait_lock);
             break;
