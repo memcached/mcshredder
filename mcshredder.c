@@ -1089,6 +1089,9 @@ static int mcslib_add(lua_State *L) {
 
     if (lua_getfield(L, 2, "clients") != LUA_TNIL) {
         clients = lua_tointeger(L, -1) / threadcount;
+        if (clients < 1) {
+            clients = 1;
+        }
     }
     lua_pop(L, 1);
 
