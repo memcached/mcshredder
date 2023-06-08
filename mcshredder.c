@@ -1094,10 +1094,10 @@ static int mcslib_add(lua_State *L) {
 
     // seed the "rate" to be one per second per connection.
     frate.rate = clients;
+    frate.period = NSEC_PER_SEC; // default is rate per second.
 
     if (lua_getfield(L, 2, "rate_limit") != LUA_TNIL) {
         frate.rate = lua_tointeger(L, -1) / threadcount;
-        frate.period = NSEC_PER_SEC; // default is rate per second.
     }
     lua_pop(L, 1);
 
