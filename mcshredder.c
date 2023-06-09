@@ -423,6 +423,7 @@ static void mcs_expand_wbuf(struct mcs_func *f, size_t len) {
 static int mcs_connect(struct mcs_func *f) {
     int status = mcmc_connect(f->mcmc, f->conn.host, f->conn.port_num, MCMC_OPTION_NONBLOCK);
     f->rbuf_used = 0;
+    f->rbuf_toconsume = 0;
     if (status == MCMC_CONNECTED) {
         // NOTE: find when this is possible?
         fprintf(stderr, "Client connected unexpectedly, please report this\n");
@@ -1887,6 +1888,11 @@ int main(int argc, char **argv) {
     };
     int optindex;
     int c;
+
+    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+        perror("failed to ignore SIGPIPE");
+        exit(EXIT_FAILURE);
+    }
 
     struct mcs_ctx *ctx = calloc(1, sizeof(struct mcs_ctx));
     pthread_mutex_init(&ctx->wait_lock, NULL);
