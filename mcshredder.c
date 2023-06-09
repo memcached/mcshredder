@@ -729,7 +729,8 @@ static void _mcs_write_value(struct mcs_func_req *r, struct mcs_func *f) {
 // sure what the compiler's going to do with this to be honest.
 static int _mcs_check_value(struct mcs_func_req *req, struct mcs_func_resp *res) {
     uint64_t hash = req->hash;
-    for (int x = 0; x < res->resp.vlen / sizeof(hash); x++) {
+    // remove \r\n from value for comparison.
+    for (int x = 0; x < (res->resp.vlen-2) / sizeof(hash); x++) {
         if (memcmp(res->resp.value + x * sizeof(hash), &hash, sizeof(hash)) != 0) {
             return -1;
         }
