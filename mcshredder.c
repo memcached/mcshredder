@@ -422,6 +422,7 @@ static void mcs_expand_wbuf(struct mcs_func *f, size_t len) {
 // over uring.
 static int mcs_connect(struct mcs_func *f) {
     int status = mcmc_connect(f->mcmc, f->conn.host, f->conn.port_num, MCMC_OPTION_NONBLOCK);
+    f->rbuf_used = 0;
     if (status == MCMC_CONNECTED) {
         // NOTE: find when this is possible?
         fprintf(stderr, "Client connected unexpectedly, please report this\n");
@@ -500,6 +501,13 @@ static int mcs_read_buf(struct mcs_func *f) {
                 if (r->resp.code != MCMC_CODE_SERVER_ERROR) {
                     fprintf(stderr, "Protocol error, reconnecting: %.*s\n", f->rbuf_used, f->rbuf);
                     return -1;
+                } else {
+                    // SERVER_ERROR can be handled upstream
+                    r->buf = f->rbuf;
+                    f->state = mcs_fstate_run;
+                    f->lua_nargs = 1;
+                    f->rbuf_toconsume = r->resp.reslen;
+                    clock_gettime(CLOCK_MONOTONIC, &r->received);
                 }
                 break;
             case MCMC_RESP_FAIL:
