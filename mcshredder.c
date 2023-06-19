@@ -896,11 +896,11 @@ static void mcs_queue_cb(void *udata, struct io_uring_cqe *cqe) {
 }
 
 static void *shredder_thread(void *arg) {
+    struct __kernel_timespec timeout_loop = { .tv_sec = 0, .tv_nsec = 500000000 };
     struct mcs_thread *t = arg;
     t->stop = false;
 
     // uring core loop
-    // TODO: check stop flag in loop.
     while (1) {
         struct io_uring_cqe *cqe;
 
@@ -933,7 +933,16 @@ static void *shredder_thread(void *arg) {
             break;
         }
 
-        io_uring_submit_and_wait(&t->ring, 1);
+        // TODO: this returns number of cqe and populates cqe array so we can
+        // restructure the above loop too?
+        int ret = io_uring_submit_and_wait_timeout(&t->ring, &cqe, 1, &timeout_loop, NULL);
+        if (ret < 0) {
+            if (t->stop) {
+                // parent told us to stop, but something is hung or not
+                // updating fast enough.
+                break;
+            }
+        }
     }
 
     pthread_mutex_lock(&t->ctx->wait_lock);
@@ -1198,6 +1207,7 @@ static void _mcs_cleanup_thread(struct mcs_thread *t) {
     struct mcs_func *f = NULL;
 
     STAILQ_FOREACH(f, &t->funcs, next) {
+        mcmc_disconnect(f->mcmc);
         free(f->rbuf);
         free(f->wbuf);
         free(f->mcmc);
