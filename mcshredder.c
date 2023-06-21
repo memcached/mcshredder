@@ -129,6 +129,10 @@ enum mcs_lua_yield {
     mcs_luayield_write = 0,
     mcs_luayield_flush,
     mcs_luayield_read,
+    mcs_luayield_c_conn,
+    mcs_luayield_c_read,
+    mcs_luayield_c_write,
+    mcs_luayield_c_flush,
 };
 
 struct mcs_func_req {
@@ -149,6 +153,20 @@ struct mcs_func_resp {
     uint16_t tokens[PARSER_MAX_TOKENS]; // offsets for start of each token
 };
 
+// client object for custom funcs
+struct mcs_func_client {
+    struct mcs_conn conn;
+    void *mcmc; // mcmc client object
+    char *wbuf;
+    size_t wbuf_size; // total size of buffer
+    int wbuf_used;
+    int wbuf_sent;
+    char *rbuf;
+    size_t rbuf_size;
+    int rbuf_used;
+    int rbuf_toconsume; // how far to skip rbuf on next read.
+};
+
 struct mcs_func {
     lua_State *L; // lua coroutine local to this function
     int self_ref; // avoid garbage collection
@@ -162,19 +180,10 @@ struct mcs_func {
     struct mcs_f_rate rate; // rate limiter
     struct mcs_f_reconn reconn; // tcp reconnector
     struct mcs_event ev;
-    struct mcs_conn conn;
+    struct mcs_func_client c;
     int limit; // stop running after N loops
-    void *mcmc; // mcmc client object
     int cqe_res; // result of most recent cqe
     int lua_nargs; // number of args to pass back to lua
-    char *wbuf;
-    size_t wbuf_size; // total size of buffer
-    int wbuf_used;
-    int wbuf_sent;
-    char *rbuf;
-    size_t rbuf_size;
-    int rbuf_used;
-    int rbuf_toconsume; // how far to skip rbuf on next read.
     int reserr; // probably -ERRNO via uring.
 };
 
@@ -306,7 +315,7 @@ static int _evset_retry_timeout(struct mcs_func *f) {
     return 0;
 }
 
-static int _evset_wrpoll(struct mcs_func *f) {
+static int _evset_wrpoll(struct mcs_func *f, struct mcs_func_client *c) {
     struct io_uring_sqe *sqe;
 
     sqe = io_uring_get_sqe(&f->parent->ring);
@@ -314,7 +323,7 @@ static int _evset_wrpoll(struct mcs_func *f) {
         return -1;
     }
 
-    io_uring_prep_poll_add(sqe, mcmc_fd(f->mcmc), POLLOUT);
+    io_uring_prep_poll_add(sqe, mcmc_fd(c->mcmc), POLLOUT);
     io_uring_sqe_set_data(sqe, &f->ev);
 
     sqe->flags |= IOSQE_IO_LINK;
@@ -345,7 +354,7 @@ static int _evset_nop(struct mcs_func *f) {
     return 0;
 }
 
-static int _evset_wrflush(struct mcs_func *f) {
+static int _evset_wrflush(struct mcs_func *f, struct mcs_func_client *c) {
     struct io_uring_sqe *sqe;
 
     sqe = io_uring_get_sqe(&f->parent->ring);
@@ -353,7 +362,7 @@ static int _evset_wrflush(struct mcs_func *f) {
         return -1;
     }
 
-    io_uring_prep_write(sqe, mcmc_fd(f->mcmc), f->wbuf + f->wbuf_sent, f->wbuf_used - f->wbuf_sent, 0);
+    io_uring_prep_write(sqe, mcmc_fd(c->mcmc), c->wbuf + c->wbuf_sent, c->wbuf_used - c->wbuf_sent, 0);
     io_uring_sqe_set_data(sqe, &f->ev);
 
     if (_evset_link_timeout(f) != 0) {
@@ -367,7 +376,7 @@ static int _evset_wrflush(struct mcs_func *f) {
     return 0;
 }
 
-static int _evset_read(struct mcs_func *f) {
+static int _evset_read(struct mcs_func *f, struct mcs_func_client *c) {
     struct io_uring_sqe *sqe;
 
     sqe = io_uring_get_sqe(&f->parent->ring);
@@ -375,7 +384,7 @@ static int _evset_read(struct mcs_func *f) {
         return -1;
     }
 
-    io_uring_prep_recv(sqe, mcmc_fd(f->mcmc), f->rbuf + f->rbuf_used, f->rbuf_size - f->rbuf_used, 0);
+    io_uring_prep_recv(sqe, mcmc_fd(c->mcmc), c->rbuf + c->rbuf_used, c->rbuf_size - c->rbuf_used, 0);
     io_uring_sqe_set_data(sqe, &f->ev);
 
     if (_evset_link_timeout(f) != 0) {
@@ -391,73 +400,72 @@ static int _evset_read(struct mcs_func *f) {
 
 // *** CORE ***
 
-static void mcs_expand_rbuf(struct mcs_func *f) {
-    if (f->rbuf_used == f->rbuf_size) {
-        f->rbuf_size *= 2;
-        char *nrb = realloc(f->rbuf, f->rbuf_size);
+static void mcs_expand_rbuf(struct mcs_func_client *c) {
+    if (c->rbuf_used == c->rbuf_size) {
+        c->rbuf_size *= 2;
+        char *nrb = realloc(c->rbuf, c->rbuf_size);
         if (nrb == NULL) {
             fprintf(stderr, "Failed to realloc read buffer\n");
             abort();
         }
-        f->rbuf = nrb;
+        c->rbuf = nrb;
     }
 }
 
 // yes this should be a "buf" abstraction
-static void mcs_expand_wbuf(struct mcs_func *f, size_t len) {
-    while (f->wbuf_used + len > f->wbuf_size) {
-        f->wbuf_size *= 2;
+static void mcs_expand_wbuf(struct mcs_func_client *c, size_t len) {
+    while (c->wbuf_used + len > c->wbuf_size) {
+        c->wbuf_size *= 2;
     }
-    char *nwb = realloc(f->wbuf, f->wbuf_size);
+    char *nwb = realloc(c->wbuf, c->wbuf_size);
     if (nwb == NULL) {
         fprintf(stderr, "Failed to realloc write buffer\n");
         abort();
     }
-    f->wbuf = nwb;
+    c->wbuf = nwb;
 }
 
 // The connect routine isn't very "io_uring-y", as it calls
 // socket()/connect() from here, but considering we're calling connect in
 // nonblock mode I'm not sure if there's any real difference in pushing it
 // over uring.
-static int mcs_connect(struct mcs_func *f) {
-    int status = mcmc_connect(f->mcmc, f->conn.host, f->conn.port_num, MCMC_OPTION_NONBLOCK);
-    f->rbuf_used = 0;
-    f->rbuf_toconsume = 0;
+static int mcs_connect(struct mcs_func_client *c) {
+    int status = mcmc_connect(c->mcmc, c->conn.host, c->conn.port_num, MCMC_OPTION_NONBLOCK);
+    c->rbuf_used = 0;
+    c->rbuf_toconsume = 0;
     if (status == MCMC_CONNECTED) {
         // NOTE: find when this is possible?
         fprintf(stderr, "Client connected unexpectedly, please report this\n");
         abort();
     } else if (status == MCMC_CONNECTING) {
         // need to wait for a writeable event.
-        f->state = mcs_fstate_connecting;
         return 0;
     } else {
         // FIXME: use real error flow once it exists
-        fprintf(stderr, "failed to connect: %s:%s\n", f->conn.host, f->conn.port_num);
+        fprintf(stderr, "failed to connect: %s:%s\n", c->conn.host, c->conn.port_num);
         return -1;
     }
     return 0;
 }
 
-void mcs_postflush(struct mcs_func *f) {
+void mcs_postflush(struct mcs_func *f, struct mcs_func_client *c) {
     int res = f->cqe_res;
 
     if (res > 0) {
-        f->wbuf_sent += res;
-        if (f->wbuf_sent < f->wbuf_used) {
+        c->wbuf_sent += res;
+        if (c->wbuf_sent < c->wbuf_used) {
             // need to continue flushing write buffer.
             f->state = mcs_fstate_flush;
         } else {
-            f->wbuf_sent = 0;
-            f->wbuf_used = 0;
+            c->wbuf_sent = 0;
+            c->wbuf_used = 0;
             f->state = mcs_fstate_run;
         }
     } else if (res < 0) {
         if (res == -EAGAIN || res == -EWOULDBLOCK) {
             // TODO: -> wrpoll -> flush
             // is this even possible with uring?
-            fprintf(stderr, "Unexpectedly could not write to socket: please report this\n");
+            fprintf(stderr, "Unexpectedly could not write to socket: please report this: %d\n", res);
             abort();
         } else {
             f->reserr = res;
@@ -474,62 +482,66 @@ void mcs_postflush(struct mcs_func *f) {
 // more data from the socket, re-parsing after another read attempt.
 // This should be an extremely rare case, and parsing is fast enough that I
 // don't want to add more logic around this right now.
-static int mcs_read_buf(struct mcs_func *f) {
+static int mcs_read_buf(struct mcs_func *f, struct mcs_func_client *c) {
     // optimistically allocate a response to minimize data copying.
     struct mcs_func_resp *r = lua_newuserdatauv(f->L, sizeof(struct mcs_func_resp), 0);
     memset(r, 0, sizeof(*r));
-    r->status = mcmc_parse_buf(f->rbuf, f->rbuf_used, &r->resp);
+    r->status = mcmc_parse_buf(c->rbuf, c->rbuf_used, &r->resp);
+    int ret = 0; // RUN
     if (r->status == MCMC_OK) {
         if (r->resp.vlen != r->resp.vlen_read) {
             lua_pop(f->L, 1); // throw away the resp object, try re-parsing later
-            mcs_expand_rbuf(f);
-            f->state = mcs_fstate_read;
+            mcs_expand_rbuf(c);
+            ret = 1; // WANT_READ
         } else {
-            r->buf = f->rbuf;
-            f->state = mcs_fstate_run;
+            r->buf = c->rbuf;
             f->lua_nargs = 1;
-            f->rbuf_toconsume = r->resp.reslen + r->resp.vlen_read;
+            c->rbuf_toconsume = r->resp.reslen + r->resp.vlen_read;
 
             clock_gettime(CLOCK_MONOTONIC, &r->received);
         }
     } else if (r->resp.code == MCMC_WANT_READ) {
         lua_pop(f->L, 1);
-        mcs_expand_rbuf(f);
-        f->state = mcs_fstate_read;
+        mcs_expand_rbuf(c);
+        ret = 1;
     } else {
         switch (r->resp.type) {
             case MCMC_RESP_ERRMSG:
                 if (r->resp.code != MCMC_CODE_SERVER_ERROR) {
-                    fprintf(stderr, "Protocol error, reconnecting: %.*s\n", f->rbuf_used, f->rbuf);
-                    return -1;
+                    fprintf(stderr, "Protocol error, reconnecting: %.*s\n", f->c.rbuf_used, f->c.rbuf);
+                    ret = -1;
                 } else {
                     // SERVER_ERROR can be handled upstream
-                    r->buf = f->rbuf;
-                    f->state = mcs_fstate_run;
+                    r->buf = f->c.rbuf;
                     f->lua_nargs = 1;
-                    f->rbuf_toconsume = r->resp.reslen;
+                    f->c.rbuf_toconsume = r->resp.reslen;
                     clock_gettime(CLOCK_MONOTONIC, &r->received);
                 }
                 break;
             case MCMC_RESP_FAIL:
-                fprintf(stderr, "Read failed, reconnecting: %.*s\n", f->rbuf_used, f->rbuf);
-                return -1;
+                fprintf(stderr, "Read failed, reconnecting: %.*s\n", f->c.rbuf_used, f->c.rbuf);
+                ret = -1;
                 break;
             default:
-                fprintf(stderr, "Read found garbage, reconnecting: %.*s\n", f->rbuf_used, f->rbuf);
-                return -1;
+                fprintf(stderr, "Read found garbage, reconnecting: %.*s\n", f->c.rbuf_used, f->c.rbuf);
+                ret = -1;
         }
     }
 
-    return 0;
+    return ret;
 }
 
-static void mcs_postread(struct mcs_func *f) {
+static void mcs_postread(struct mcs_func *f, struct mcs_func_client *c) {
     int res = f->cqe_res;
 
     if (res > 0) {
-        f->rbuf_used += res;
-        if (mcs_read_buf(f) != 0) {
+        c->rbuf_used += res;
+        int ret = mcs_read_buf(f, c);
+        if (ret == 0) {
+            f->state = mcs_fstate_run;
+        } else if (ret == 1) {
+            f->state = mcs_fstate_read;
+        } else if (ret < 0) {
             f->reserr = 1;
             f->state = mcs_fstate_syserr;
         }
@@ -565,7 +577,7 @@ static int mcs_reschedule(struct mcs_func *f) {
 }
 
 static void mcs_syserror(struct mcs_func *f) {
-    mcmc_disconnect(f->mcmc);
+    mcmc_disconnect(f->c.mcmc);
     if (f->reserr == 0) {
         fprintf(stderr, "%s: conn gracefully disconnected\n", f->fname);
     } else {
@@ -589,7 +601,7 @@ static void mcs_restart(struct mcs_func *f) {
     if (f->limit != 0) {
         f->limit--;
         if (f->limit == 0) {
-            mcmc_disconnect(f->mcmc);
+            mcmc_disconnect(f->c.mcmc);
             f->state = mcs_fstate_stop;
             return;
         }
@@ -597,14 +609,14 @@ static void mcs_restart(struct mcs_func *f) {
     if (f->reconn.every != 0) {
         f->reconn.after--;
         if (f->reconn.after == 0) {
-            mcmc_disconnect(f->mcmc);
+            mcmc_disconnect(f->c.mcmc);
             f->reconn.after = f->reconn.every;
             f->state = mcs_fstate_disconn;
             return;
         }
     }
     if (f->parent->stop) {
-        mcmc_disconnect(f->mcmc);
+        mcmc_disconnect(f->c.mcmc);
         f->state = mcs_fstate_stop;
         return;
     }
@@ -621,21 +633,23 @@ static int mcs_func_run(void *udata) {
     while (!stop) {
     switch (f->state) {
         case mcs_fstate_disconn:
-            if (mcs_connect(f) != 0) {
-                mcmc_disconnect(f->mcmc);
+            if (mcs_connect(&f->c) == 0) {
+                f->state = mcs_fstate_connecting;
+            } else {
+                mcmc_disconnect(f->c.mcmc);
                 f->state = mcs_fstate_retry;
             }
             break;
         case mcs_fstate_connecting:
-            if (_evset_wrpoll(f) != 0) {
+            if (_evset_wrpoll(f, &f->c) != 0) {
                 return -1;
             }
             f->state = mcs_fstate_postconnect;
             stop = true;
             break;
         case mcs_fstate_postconnect:
-            if (mcmc_check_nonblock_connect(f->mcmc, &err) != MCMC_OK) {
-                mcmc_disconnect(f->mcmc);
+            if (mcmc_check_nonblock_connect(f->c.mcmc, &err) != MCMC_OK) {
+                mcmc_disconnect(f->c.mcmc);
                 f->state = mcs_fstate_retry;
             } else {
                 mcs_start_limiter(f);
@@ -643,7 +657,9 @@ static int mcs_func_run(void *udata) {
             }
             break;
         case mcs_fstate_run:
-            mcs_func_lua(f);
+            if (mcs_func_lua(f)) {
+                f->state = mcs_fstate_rerun;
+            }
             break;
         case mcs_fstate_restart:
             mcs_restart(f);
@@ -657,7 +673,7 @@ static int mcs_func_run(void *udata) {
             }
             break;
         case mcs_fstate_flush:
-            if (_evset_wrflush(f) == 0) {
+            if (_evset_wrflush(f, &f->c) == 0) {
                 f->state = mcs_fstate_postflush;
                 stop = true;
             } else {
@@ -665,10 +681,10 @@ static int mcs_func_run(void *udata) {
             }
             break;
         case mcs_fstate_postflush:
-            mcs_postflush(f);
+            mcs_postflush(f, &f->c);
             break;
         case mcs_fstate_read:
-            if (_evset_read(f) == 0) {
+            if (_evset_read(f, &f->c) == 0) {
                 f->state = mcs_fstate_postread;
                 stop = true;
             } else {
@@ -676,7 +692,7 @@ static int mcs_func_run(void *udata) {
             }
             break;
         case mcs_fstate_postread:
-            mcs_postread(f);
+            mcs_postread(f, &f->c);
             break;
         case mcs_fstate_retry:
             if (_evset_retry_timeout(f) == 0) {
@@ -706,24 +722,100 @@ static int mcs_func_run(void *udata) {
     return 0;
 }
 
+static int mcs_cfunc_run(void *udata) {
+    struct mcs_func *f = udata;
+    struct mcs_func_client *c = NULL;
+
+    bool stop = false;
+    int err = 0;
+    while (!stop) {
+    switch (f->state) {
+        case mcs_fstate_connecting:
+            c = lua_touserdata(f->L, 1);
+            if (_evset_wrpoll(f, c) != 0) {
+                return -1;
+            }
+            f->state = mcs_fstate_postconnect;
+            stop = true;
+            break;
+        case mcs_fstate_postconnect:
+            c = lua_touserdata(f->L, 1);
+            if (mcmc_check_nonblock_connect(c->mcmc, &err) != MCMC_OK) {
+                mcmc_disconnect(c->mcmc);
+                lua_pushboolean(f->L, 0);
+                f->lua_nargs = 1;
+            }
+            f->state = mcs_fstate_run;
+            break;
+        case mcs_fstate_read:
+            c = lua_touserdata(f->L, 1);
+            if (_evset_read(f, c) == 0) {
+                f->state = mcs_fstate_postread;
+                stop = true;
+            } else {
+                return -1;
+            }
+            break;
+        case mcs_fstate_postread:
+            c = lua_touserdata(f->L, 1);
+            mcs_postread(f, c);
+            break;
+        case mcs_fstate_flush:
+            c = lua_touserdata(f->L, 1);
+            if (_evset_wrflush(f, c) == 0) {
+                f->state = mcs_fstate_postflush;
+                stop = true;
+            } else {
+                return -1;
+            }
+            break;
+        case mcs_fstate_postflush:
+            c = lua_touserdata(f->L, 1);
+            mcs_postflush(f, c);
+            break;
+        case mcs_fstate_syserr:
+            c = lua_touserdata(f->L, 1);
+            mcmc_disconnect(c);
+            // FIXME: need better way to communicate client has errored.
+            lua_pushinteger(f->L, f->reserr);
+            f->state = mcs_fstate_run;
+            break;
+        case mcs_fstate_run:
+            if (mcs_func_lua(f)) {
+                f->state = mcs_fstate_stop;
+            }
+            break;
+        case mcs_fstate_stop:
+            f->parent->active_funcs--;
+            stop = true;
+            break;
+        default:
+            fprintf(stderr, "Unhandled custom function state, aborting\n");
+            abort();
+    }
+    }
+
+    return 0;
+}
+
 // Turn the 8 byte hash into a pattern-fill for the value. Just filling with
 // the same value can miss a few classes of bugs.
-static void _mcs_write_value(struct mcs_func_req *r, struct mcs_func *f) {
+static void _mcs_write_value(struct mcs_func_req *r, struct mcs_func_client *c) {
     uint64_t hash = r->hash;
     for (int x = 0; x < r->vlen / sizeof(hash); x++) {
-        memcpy(f->wbuf + f->wbuf_used, &hash, sizeof(hash));
+        memcpy(c->wbuf + c->wbuf_used, &hash, sizeof(hash));
         hash++;
-        f->wbuf_used += sizeof(hash);
+        c->wbuf_used += sizeof(hash);
     }
 
     int remain = r->vlen % sizeof(hash);
     for (int x = 0; x < remain; x++) {
-        f->wbuf[f->wbuf_used] = '#';
-        f->wbuf_used++;
+        c->wbuf[c->wbuf_used] = '#';
+        c->wbuf_used++;
     }
 
-    memcpy(f->wbuf + f->wbuf_used, "\r\n", 2);
-    f->wbuf_used += 2;
+    memcpy(c->wbuf + c->wbuf_used, "\r\n", 2);
+    c->wbuf_used += 2;
 }
 
 // should be doing cast-comparisons since that should be a bit faster, but not
@@ -746,7 +838,7 @@ static int _mcs_check_value(struct mcs_func_req *req, struct mcs_func_resp *res)
 }
 
 // writes the passed argument to the client buffer
-static int mcslib_write_c(struct mcs_func *f) {
+static int mcslib_write_c(struct mcs_func *f, struct mcs_func_client *c) {
     int type = lua_type(f->L, -1);
     size_t len = 0;
     int vlen = 0;
@@ -763,15 +855,15 @@ static int mcslib_write_c(struct mcs_func *f) {
         rline = luaL_tolstring(f->L, -1, &len);
     }
 
-    mcs_expand_wbuf(f, len + vlen + 2);
+    mcs_expand_wbuf(c, len + vlen + 2);
 
-    memcpy(f->wbuf + f->wbuf_used, rline, len);
-    f->wbuf_used += len;
+    memcpy(c->wbuf + c->wbuf_used, rline, len);
+    c->wbuf_used += len;
 
     lua_pop(f->L, 1);
 
     if (vlen != 0) {
-        _mcs_write_value(req, f);
+        _mcs_write_value(req, c);
     }
     return 0;
 }
@@ -779,23 +871,22 @@ static int mcslib_write_c(struct mcs_func *f) {
 // TODO: the read routine can offset via rbuf_toconsume until we hit
 // "MCMC_WANT_READ" to avoid memmove's in most/many cases.
 // Avoiding this optimization for now for stability.
-static int mcslib_read_c(struct mcs_func *f) {
+static int mcslib_read_c(struct mcs_func_client *c) {
     // first we need to see how far to move the rbuf, based on the previous
     // successful read.
-    if (f->rbuf_toconsume != 0) {
-        f->rbuf_used -= f->rbuf_toconsume;
-        if (f->rbuf_used > 0) {
-            memmove(f->rbuf, f->rbuf+f->rbuf_toconsume, f->rbuf_used);
+    if (c->rbuf_toconsume != 0) {
+        c->rbuf_used -= c->rbuf_toconsume;
+        if (c->rbuf_used > 0) {
+            memmove(c->rbuf, c->rbuf+c->rbuf_toconsume, c->rbuf_used);
         }
-        f->rbuf_toconsume = 0;
+        c->rbuf_toconsume = 0;
     }
 
-    if (f->rbuf_used == 0) {
-        f->state = mcs_fstate_read;
+    if (c->rbuf_used == 0) {
+        return 0;
     } else {
-        mcs_read_buf(f);
+        return 1;
     }
-    return 0;
 }
 
 // functions that yield should do minimal work then kick back here for
@@ -807,18 +898,59 @@ static int mcslib_read_c(struct mcs_func *f) {
 // I'm keeping a switch statement here because that's a little easier to debug
 static int mcs_func_lua_yield(struct mcs_func *f, int nresults) {
     int yield_type = lua_tointeger(f->L, -1);
+    struct mcs_func_client *c = NULL;
     lua_pop(f->L, 1);
     int res = 0;
     switch (yield_type) {
         case mcs_luayield_write:
-            res = mcslib_write_c(f);
+            res = mcslib_write_c(f, &f->c);
             break;
         case mcs_luayield_flush:
-            f->wbuf_sent = 0;
+            f->c.wbuf_sent = 0;
             f->state = mcs_fstate_flush;
             break;
         case mcs_luayield_read:
-            res = mcslib_read_c(f);
+            if (mcslib_read_c(&f->c)) {
+                int ret = mcs_read_buf(f, &f->c);
+                if (ret == 0) {
+                    f->state = mcs_fstate_run;
+                } else if (ret == 1) {
+                    f->state = mcs_fstate_read;
+                } else if (ret < 0) {
+                    f->reserr = 1;
+                    f->state = mcs_fstate_syserr;
+                }
+            } else {
+                f->state = mcs_fstate_read;
+            }
+            break;
+        case mcs_luayield_c_conn:
+            f->state = mcs_fstate_connecting;
+            break;
+        case mcs_luayield_c_read:
+            c = lua_touserdata(f->L, 1);
+            if (mcslib_read_c(c)) {
+                int ret = mcs_read_buf(f, c);
+                if (ret == 0) {
+                    f->state = mcs_fstate_run;
+                } else if (ret == 1) {
+                    f->state = mcs_fstate_read;
+                } else if (ret < 0) {
+                    f->reserr = 1;
+                    f->state = mcs_fstate_syserr;
+                }
+            } else {
+                f->state = mcs_fstate_read;
+            }
+            break;
+        case mcs_luayield_c_write:
+            c = lua_touserdata(f->L, 1);
+            res = mcslib_write_c(f, c);
+            break;
+        case mcs_luayield_c_flush:
+            c = lua_touserdata(f->L, 1);
+            c->wbuf_sent = 0;
+            f->state = mcs_fstate_flush;
             break;
         default:
             fprintf(stderr, "Unhandled yield state, aborting\n");
@@ -847,7 +979,7 @@ static int mcs_func_lua(struct mcs_func *f) {
         case LUA_YIELD:
             status = lua_resume(f->L, NULL, f->lua_nargs, &nresults);
             if (status == LUA_OK) {
-                f->state = mcs_fstate_rerun;
+                return 1;
             } else if (status == LUA_YIELD) {
                 // We're paused for some reason.
                 return mcs_func_lua_yield(f, nresults);
@@ -964,7 +1096,9 @@ static int mcslib_thread(lua_State *L) {
     t->ctx = ctx;
     t->active_funcs = 0;
     t->L = luaL_newstate();
-    // TODO: what to stuff into the extraspace? ctx or thread?
+    // allow in-thread functions to access both the parent thread and ctx
+    struct mcs_thread **extra = lua_getextraspace(t->L);
+    *extra = t;
     luaL_openlibs(t->L);
     register_lua_libs(t->L);
 
@@ -998,7 +1132,7 @@ static struct mcs_func *mcs_add_func(struct mcs_thread *t) {
     f->self_ref = luaL_ref(t->L, LUA_REGISTRYINDEX);
 
     // allocate mcmc client
-    f->mcmc = calloc(1, mcmc_size(MCMC_OPTION_BLANK));
+    f->c.mcmc = calloc(1, mcmc_size(MCMC_OPTION_BLANK));
 
     // kick off the state machine.
     f->ev.qcb = mcs_func_run;
@@ -1006,11 +1140,11 @@ static struct mcs_func *mcs_add_func(struct mcs_thread *t) {
     f->ev.udata = f;
     f->state = mcs_fstate_disconn;
 
-    f->wbuf = malloc(WBUF_INITIAL_SIZE);
-    f->wbuf_size = WBUF_INITIAL_SIZE;
+    f->c.wbuf = malloc(WBUF_INITIAL_SIZE);
+    f->c.wbuf_size = WBUF_INITIAL_SIZE;
 
-    f->rbuf = malloc(RBUF_INITIAL_SIZE);
-    f->rbuf_size = RBUF_INITIAL_SIZE;
+    f->c.rbuf = malloc(RBUF_INITIAL_SIZE);
+    f->c.rbuf_size = RBUF_INITIAL_SIZE;
 
     return f;
 }
@@ -1069,8 +1203,7 @@ static void _mcs_copy_table(lua_State *from, lua_State *to) {
 // or table of mcsthread, table
 // configures thread.
 // arguments:
-// clients, rate_limit, rate_period, reconn_every, reconn_random, ramp_period,
-// start_delay
+// clients, rate_limit, rate_period, reconn_every, limit
 static int mcslib_add(lua_State *L) {
     struct mcs_ctx *ctx = *(struct mcs_ctx **)lua_getextraspace(L);
     struct mcs_thread **threads = NULL;
@@ -1193,7 +1326,7 @@ static int mcslib_add(lua_State *L) {
             // first run counts against the limiter
             f->limit = limit;
 
-            memcpy(&f->conn, &ctx->conn, sizeof(f->conn));
+            memcpy(&f->c.conn, &ctx->conn, sizeof(f->c.conn));
         }
         if (arg) {
             lua_pop(t->L, 1);
@@ -1203,14 +1336,65 @@ static int mcslib_add(lua_State *L) {
     return 0;
 }
 
+static struct mcs_func *mcs_add_custom_func(struct mcs_thread *t) {
+    // create coroutine using thread VM.
+    struct mcs_func *f = lua_newuserdatauv(t->L, sizeof(struct mcs_func), 0);
+    memset(f, 0, sizeof(struct mcs_func));
+    STAILQ_INSERT_TAIL(&t->funcs, f, next);
+    t->active_funcs++;
+
+    f->parent = t;
+
+    // prepare the function's coroutine
+    lua_newthread(t->L);
+    lua_State *Lc = lua_tothread(t->L, -1);
+    f->L = Lc;
+    // pops thread
+    f->self_ref_coro = luaL_ref(t->L, LUA_REGISTRYINDEX);
+    // pop the func
+    f->self_ref = luaL_ref(t->L, LUA_REGISTRYINDEX);
+
+    // kick off the state machine.
+    f->ev.qcb = mcs_cfunc_run;
+    f->ev.cb = mcs_queue_cb;
+    f->ev.udata = f;
+    f->state = mcs_fstate_run;
+
+    return f;
+}
+
+// TODO: add the argument table.
+static int mcslib_add_custom(lua_State *L) {
+    struct mcs_ctx *ctx = *(struct mcs_ctx **)lua_getextraspace(L);
+    struct mcs_thread *t = lua_touserdata(L, 1);
+    //int arg_type = lua_type(L, 3);
+    luaL_checktype(L, 2, LUA_TTABLE);
+
+    const char *fname = NULL;
+    if (lua_getfield(L, 2, "func") != LUA_TNIL) {
+        fname = lua_tostring(L, -1);
+    }
+    lua_pop(L, 1);
+    if (fname == NULL) {
+        luaL_error(L, "mcs.add_custom call missing 'func' argument");
+    }
+
+    struct mcs_func *f = mcs_add_custom_func(t);
+
+    f->fname = strdup(fname);
+    memcpy(&f->c.conn, &ctx->conn, sizeof(f->c.conn));
+
+    return 0;
+}
+
 static void _mcs_cleanup_thread(struct mcs_thread *t) {
     struct mcs_func *f = NULL;
 
     STAILQ_FOREACH(f, &t->funcs, next) {
-        mcmc_disconnect(f->mcmc);
-        free(f->rbuf);
-        free(f->wbuf);
-        free(f->mcmc);
+        mcmc_disconnect(f->c.mcmc);
+        free(f->c.rbuf);
+        free(f->c.wbuf);
+        free(f->c.mcmc);
         free(f->fname);
         luaL_unref(t->L, LUA_REGISTRYINDEX, f->self_ref);
         luaL_unref(t->L, LUA_REGISTRYINDEX, f->self_ref_coro);
@@ -1359,6 +1543,90 @@ static int _token_len(struct mcs_func_resp *r, int token) {
         e--;
     }
     return e - s;
+}
+
+// TODO: metatable with gc routine for freeing conn states.
+// TODO: if 1 is TNIL use defaults.
+static int mcslib_client_new(lua_State *L) {
+    struct mcs_thread *t = *(struct mcs_thread **)lua_getextraspace(L);
+    luaL_checktype(L, 1, LUA_TTABLE);
+    struct mcs_func_client *c = lua_newuserdatauv(L, sizeof(struct mcs_func_client), 0);
+    memset(c, 0, sizeof(*c));
+
+    // seed the socket parameters and allow overrides.
+    memcpy(&c->conn, &t->ctx->conn, sizeof(t->ctx->conn));
+
+    // TODO: throw error if strings too long.
+    if (lua_getfield(L, 1, "host") != LUA_TNIL) {
+        size_t len = 0;
+        const char *host = lua_tolstring(L, -1, &len);
+        strncpy(c->conn.host, host, NI_MAXHOST);
+    }
+    lua_pop(L, 1);
+
+    if (lua_getfield(L, 1, "port") != LUA_TNIL) {
+        size_t len = 0;
+        const char *port = lua_tolstring(L, -1, &len);
+        strncpy(c->conn.port_num, port, NI_MAXSERV);
+    }
+    lua_pop(L, 1);
+
+    // TODO: buffer presizing? limits?
+    // allocate mcmc client
+    c->mcmc = calloc(1, mcmc_size(MCMC_OPTION_BLANK));
+
+    c->wbuf = malloc(WBUF_INITIAL_SIZE);
+    c->wbuf_size = WBUF_INITIAL_SIZE;
+
+    c->rbuf = malloc(RBUF_INITIAL_SIZE);
+    c->rbuf_size = RBUF_INITIAL_SIZE;
+
+    // return client object.
+    return 1;
+}
+
+static int mcslib_client_connect(lua_State *L) {
+    struct mcs_func_client *c = lua_touserdata(L, 1);
+    int ret = mcs_connect(c);
+    if (ret == 0) {
+        // TODO: pushvalue to copy the userdata or we good here?
+        lua_pushinteger(L, mcs_luayield_c_conn);
+        return lua_yield(L, 2);
+    } else {
+        // Failed to connect.
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
+    return 0;
+}
+
+// yield new state for calling mcs_read_buf but against an external
+// client object.
+static int mcslib_client_read(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TUSERDATA);
+    lua_pushinteger(L, mcs_luayield_c_read);
+    return lua_yield(L, 2);
+}
+
+// yield and read with a special handler that just looks for \r\n.
+// chomp newlines and return string to lua.
+// TODO: also add a readline_split() to auto-split the line?
+static int mcslib_client_readline(lua_State *L) {
+
+    return 0;
+}
+
+static int mcslib_client_write(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TUSERDATA);
+    lua_pushinteger(L, mcs_luayield_c_write);
+    return lua_yield(L, 2);
+}
+
+static int mcslib_client_flush(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TUSERDATA);
+    lua_pushinteger(L, mcs_luayield_c_flush);
+    return lua_yield(L, 2);
 }
 
 // TODO: minimal argument validation?
@@ -1813,8 +2081,16 @@ static void register_lua_libs(lua_State *L) {
     const struct luaL_Reg mcs_f [] = {
         {"thread", mcslib_thread},
         {"add", mcslib_add},
+        {"add_custom", mcslib_add_custom},
         {"run", mcslib_add}, // FIXME: remove this in a week.
         {"shredder", mcslib_shredder},
+        // custom func functions.
+        {"client_new", mcslib_client_new},
+        {"client_connect", mcslib_client_connect},
+        {"client_read", mcslib_client_read},
+        {"client_write", mcslib_client_write},
+        {"client_flush", mcslib_client_flush},
+        {"client_readline", mcslib_client_readline},
         // func functions.
         {"write", mcslib_write},
         {"flush", mcslib_flush},
