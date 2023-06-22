@@ -511,7 +511,7 @@ static int mcs_read_buf(struct mcs_func *f, struct mcs_func_client *c) {
             switch (r->resp.type) {
                 case MCMC_RESP_ERRMSG:
                     if (r->resp.code != MCMC_CODE_SERVER_ERROR) {
-                        fprintf(stderr, "Protocol error, reconnecting: %.*s\n", f->c.rbuf_used, f->c.rbuf);
+                        fprintf(stderr, "Protocol error, reconnecting: %.*s\n", c->rbuf_used, c->rbuf);
                         ret = -1;
                     } else {
                         // SERVER_ERROR can be handled upstream
@@ -522,19 +522,19 @@ static int mcs_read_buf(struct mcs_func *f, struct mcs_func_client *c) {
                     }
                     break;
                 case MCMC_RESP_FAIL:
-                    fprintf(stderr, "Read failed, reconnecting: %.*s\n", f->c.rbuf_used, f->c.rbuf);
+                    fprintf(stderr, "Read failed, reconnecting: %.*s\n", c->rbuf_used, c->rbuf);
                     ret = -1;
                     break;
                 default:
-                    fprintf(stderr, "Read found garbage, reconnecting: %.*s\n", f->c.rbuf_used, f->c.rbuf);
+                    fprintf(stderr, "Read found garbage, reconnecting: %.*s\n", c->rbuf_used, c->rbuf);
                     ret = -1;
             }
         }
     } else {
         // looking for a nonstandard or expanded protocol response line.
-        f->buf_readline = 0;
         char *end = memchr(c->rbuf, '\n', c->rbuf_used);
         if (end != NULL) {
+            f->buf_readline = 0;
             // FIXME: making an assumption the minimum read buffer size is
             // always big enough for one line. Could probably add the
             // detection code anyway once I'm sure this works?
