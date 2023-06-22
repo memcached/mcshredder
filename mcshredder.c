@@ -131,6 +131,7 @@ enum mcs_lua_yield {
     mcs_luayield_read,
     mcs_luayield_c_conn,
     mcs_luayield_c_read,
+    mcs_luayield_c_readline,
     mcs_luayield_c_write,
     mcs_luayield_c_flush,
 };
@@ -185,6 +186,7 @@ struct mcs_func {
     int cqe_res; // result of most recent cqe
     int lua_nargs; // number of args to pass back to lua
     int reserr; // probably -ERRNO via uring.
+    int buf_readline; // skip parsing on next line response.
 };
 
 typedef STAILQ_HEAD(func_head_s, mcs_func) func_head_t;
@@ -483,48 +485,71 @@ void mcs_postflush(struct mcs_func *f, struct mcs_func_client *c) {
 // This should be an extremely rare case, and parsing is fast enough that I
 // don't want to add more logic around this right now.
 static int mcs_read_buf(struct mcs_func *f, struct mcs_func_client *c) {
-    // optimistically allocate a response to minimize data copying.
-    struct mcs_func_resp *r = lua_newuserdatauv(f->L, sizeof(struct mcs_func_resp), 0);
-    memset(r, 0, sizeof(*r));
-    r->status = mcmc_parse_buf(c->rbuf, c->rbuf_used, &r->resp);
     int ret = 0; // RUN
-    if (r->status == MCMC_OK) {
-        if (r->resp.vlen != r->resp.vlen_read) {
-            lua_pop(f->L, 1); // throw away the resp object, try re-parsing later
-            mcs_expand_rbuf(c);
-            ret = 1; // WANT_READ
-        } else {
-            r->buf = c->rbuf;
-            f->lua_nargs = 1;
-            c->rbuf_toconsume = r->resp.reslen + r->resp.vlen_read;
+    if (f->buf_readline == 0) {
+        // optimistically allocate a response to minimize data copying.
+        struct mcs_func_resp *r = lua_newuserdatauv(f->L, sizeof(struct mcs_func_resp), 0);
+        memset(r, 0, sizeof(*r));
+        r->status = mcmc_parse_buf(c->rbuf, c->rbuf_used, &r->resp);
+        if (r->status == MCMC_OK) {
+            if (r->resp.vlen != r->resp.vlen_read) {
+                lua_pop(f->L, 1); // throw away the resp object, try re-parsing later
+                mcs_expand_rbuf(c);
+                ret = 1; // WANT_READ
+            } else {
+                r->buf = c->rbuf;
+                f->lua_nargs = 1;
+                c->rbuf_toconsume = r->resp.reslen + r->resp.vlen_read;
 
-            clock_gettime(CLOCK_MONOTONIC, &r->received);
-        }
-    } else if (r->resp.code == MCMC_WANT_READ) {
-        lua_pop(f->L, 1);
-        mcs_expand_rbuf(c);
-        ret = 1;
-    } else {
-        switch (r->resp.type) {
-            case MCMC_RESP_ERRMSG:
-                if (r->resp.code != MCMC_CODE_SERVER_ERROR) {
-                    fprintf(stderr, "Protocol error, reconnecting: %.*s\n", f->c.rbuf_used, f->c.rbuf);
+                clock_gettime(CLOCK_MONOTONIC, &r->received);
+            }
+        } else if (r->resp.code == MCMC_WANT_READ) {
+            lua_pop(f->L, 1);
+            mcs_expand_rbuf(c);
+            ret = 1;
+        } else {
+            switch (r->resp.type) {
+                case MCMC_RESP_ERRMSG:
+                    if (r->resp.code != MCMC_CODE_SERVER_ERROR) {
+                        fprintf(stderr, "Protocol error, reconnecting: %.*s\n", f->c.rbuf_used, f->c.rbuf);
+                        ret = -1;
+                    } else {
+                        // SERVER_ERROR can be handled upstream
+                        r->buf = f->c.rbuf;
+                        f->lua_nargs = 1;
+                        c->rbuf_toconsume = r->resp.reslen;
+                        clock_gettime(CLOCK_MONOTONIC, &r->received);
+                    }
+                    break;
+                case MCMC_RESP_FAIL:
+                    fprintf(stderr, "Read failed, reconnecting: %.*s\n", f->c.rbuf_used, f->c.rbuf);
                     ret = -1;
-                } else {
-                    // SERVER_ERROR can be handled upstream
-                    r->buf = f->c.rbuf;
-                    f->lua_nargs = 1;
-                    f->c.rbuf_toconsume = r->resp.reslen;
-                    clock_gettime(CLOCK_MONOTONIC, &r->received);
-                }
-                break;
-            case MCMC_RESP_FAIL:
-                fprintf(stderr, "Read failed, reconnecting: %.*s\n", f->c.rbuf_used, f->c.rbuf);
+                    break;
+                default:
+                    fprintf(stderr, "Read found garbage, reconnecting: %.*s\n", f->c.rbuf_used, f->c.rbuf);
+                    ret = -1;
+            }
+        }
+    } else {
+        // looking for a nonstandard or expanded protocol response line.
+        f->buf_readline = 0;
+        char *end = memchr(c->rbuf, '\n', c->rbuf_used);
+        if (end != NULL) {
+            // FIXME: making an assumption the minimum read buffer size is
+            // always big enough for one line. Could probably add the
+            // detection code anyway once I'm sure this works?
+            size_t len = end - c->rbuf + 1;
+            c->rbuf_toconsume += len;
+            if (len < 2) {
+                fprintf(stderr, "Protocol error, short response: %d\n", (int)len);
                 ret = -1;
-                break;
-            default:
-                fprintf(stderr, "Read found garbage, reconnecting: %.*s\n", f->c.rbuf_used, f->c.rbuf);
-                ret = -1;
+            } else {
+                len -= 2; // FIXME: assuming \r\n should be safe.
+                lua_pushlstring(f->L, c->rbuf, len);
+                f->lua_nargs = 1;
+            }
+        } else {
+            ret = 1; // WANT_READ
         }
     }
 
@@ -927,6 +952,9 @@ static int mcs_func_lua_yield(struct mcs_func *f, int nresults) {
         case mcs_luayield_c_conn:
             f->state = mcs_fstate_connecting;
             break;
+        case mcs_luayield_c_readline:
+            f->buf_readline = 1;
+            // explicit fall through.
         case mcs_luayield_c_read:
             c = lua_touserdata(f->L, 1);
             if (mcslib_read_c(c)) {
@@ -1613,8 +1641,9 @@ static int mcslib_client_read(lua_State *L) {
 // chomp newlines and return string to lua.
 // TODO: also add a readline_split() to auto-split the line?
 static int mcslib_client_readline(lua_State *L) {
-
-    return 0;
+    luaL_checktype(L, 1, LUA_TUSERDATA);
+    lua_pushinteger(L, mcs_luayield_c_readline);
+    return lua_yield(L, 2);
 }
 
 static int mcslib_client_write(lua_State *L) {
