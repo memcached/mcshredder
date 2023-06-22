@@ -1469,10 +1469,12 @@ static int mcslib_shredder(lua_State *L) {
 
     if (type == LUA_TNUMBER) {
         int tosleep = lua_tointeger(L, -1);
-        clock_gettime(CLOCK_REALTIME, &wait);
-        wait.tv_nsec = 0;
-        wait.tv_sec += tosleep;
-        use_wait = true;
+        if (tosleep != 0) {
+            clock_gettime(CLOCK_REALTIME, &wait);
+            wait.tv_nsec = 0;
+            wait.tv_sec += tosleep;
+            use_wait = true;
+        }
     }
 
     while (ctx->active_threads) {
@@ -1674,6 +1676,95 @@ static int mcslib_flush(lua_State *L) {
 static int mcslib_read(lua_State *L) {
     lua_pushinteger(L, mcs_luayield_read);
     return lua_yield(L, 1);
+}
+
+// A mouthful of a name for a very specific accelerator function.
+// Takes destination client, res object
+static int mcslib_client_write_mgres_to_ms(lua_State *L) {
+    struct mcs_func_resp *r = lua_touserdata(L, 1);
+    struct mcs_func_client *c = lua_touserdata(L, 2);
+    // tokenize the response to simplify rewriting the response.
+    if (!r->ntokens) {
+        _tokenize(r);
+    }
+
+    // make sure we have headroom in the dest wbuf
+    // FIXME: get proper full length instead of 2k hedge + vlen
+    mcs_expand_wbuf(c, r->resp.vlen + 2048);
+
+    // find the key token from response
+    int x = 1; // index of first flag
+    char *token = NULL;
+    int tlen = 0;
+    for (; x < r->ntokens; x++) {
+        if (r->buf[r->tokens[x]] == 'k') {
+            token = r->buf + r->tokens[x];
+            tlen = _token_len(r, x);
+            break;
+        }
+    }
+
+    // write "ms key len"
+    char *p = c->wbuf + c->wbuf_used;
+    memcpy(p, "ms ", 3);
+    p += 3;
+
+    memcpy(p, token+1, tlen-1); // skip the 'k' flag
+    p += tlen-1;
+
+    *p = ' ';
+    p++;
+
+    // write value length
+    p = itoa_u32(r->resp.vlen-2, p);
+
+    *p = ' ';
+    p++;
+
+    // loop tokens, rewrite:
+    // f -> F
+    // t -> T (t-1 -> T0)
+    for (x = 1; x < r->ntokens; x++) {
+        token = r->buf + r->tokens[x];
+        tlen = _token_len(r, x);
+        switch (r->buf[r->tokens[x]]) {
+            case 'f':
+                *p = 'F';
+                p++;
+                memcpy(p, token+1, tlen-1);
+                p += tlen-1;
+
+                *p = ' ';
+                p++;
+                break;
+            case 't':
+                *p = 'T';
+                p++;
+                if (token[1] == '-') {
+                   *p = '0';
+                   p++;
+                } else {
+                    memcpy(p, token+1, tlen-1);
+                }
+                *p = ' ';
+                p++;
+                break;
+        }
+    }
+
+    // add ME flag
+    // TODO: make set mode optional.
+    memcpy(p, "q ME\r\n", 6);
+    p += 6;
+
+    // copy the value data, which already includes "\r\n"
+    memcpy(p, r->resp.value, r->resp.vlen);
+    p += r->resp.vlen;
+
+    // note buffer usage.
+    c->wbuf_used += p - (c->wbuf + c->wbuf_used);
+
+    return 0;
 }
 
 static int mcslib_resline(lua_State *L) {
@@ -2120,6 +2211,7 @@ static void register_lua_libs(lua_State *L) {
         {"client_write", mcslib_client_write},
         {"client_flush", mcslib_client_flush},
         {"client_readline", mcslib_client_readline},
+        {"client_write_mgres_to_ms", mcslib_client_write_mgres_to_ms},
         // func functions.
         {"write", mcslib_write},
         {"flush", mcslib_flush},
