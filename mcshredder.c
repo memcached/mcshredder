@@ -1254,6 +1254,9 @@ static void _mcs_copy_table(lua_State *from, lua_State *to) {
                 lua_pushnumber(to, lua_tonumber(from, -1));
             }
             break;
+        case LUA_TBOOLEAN:
+            lua_pushboolean(to, lua_toboolean(from, -1));
+            break;
         case LUA_TSTRING:
             lua_pushlstring(to, lua_tostring(from, -1), lua_rawlen(from, -1));
             break;
@@ -1277,6 +1280,7 @@ static void _mcs_copy_table(lua_State *from, lua_State *to) {
                         break;
                     default:
                         // TODO: error
+                        fprintf(stderr, "UNHANDLED KEY TYPE: %s\n", lua_typename(from, keytype));
                         break;
                 }
                 _mcs_copy_table(from, to); // recurse.
@@ -1284,6 +1288,8 @@ static void _mcs_copy_table(lua_State *from, lua_State *to) {
                 lua_pop(from, 1); // drop value, keep key.
             }
             break;
+        default:
+            fprintf(stderr, "UNHANDLED TYPE: %s\n", lua_typename(from, type));
     }
 }
 
