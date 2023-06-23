@@ -496,26 +496,46 @@ void mcs_postflush(struct mcs_func *f, struct mcs_func_client *c) {
     }
 }
 
+static void _mcs_consume_buf(struct mcs_func_client *c) {
+    if (c->rbuf_toconsume != 0) {
+        c->rbuf_used -= c->rbuf_toconsume;
+        if (c->rbuf_used > 0) {
+            memmove(c->rbuf, c->rbuf+c->rbuf_toconsume, c->rbuf_used);
+        }
+        c->rbuf_toconsume = 0;
+    }
+}
+
 // Note: this function throws away the response object if it needs to read
 // more data from the socket, re-parsing after another read attempt.
 // This should be an extremely rare case, and parsing is fast enough that I
 // don't want to add more logic around this right now.
 static int mcs_read_buf(struct mcs_func *f, struct mcs_func_client *c) {
     int ret = 0; // RUN
+    char *rbuf_offset = c->rbuf + c->rbuf_toconsume;
+    int rbuf_remain = c->rbuf_used - c->rbuf_toconsume;
     if (f->buf_readline == 0) {
         // optimistically allocate a response to minimize data copying.
         struct mcs_func_resp *r = lua_newuserdatauv(f->L, sizeof(struct mcs_func_resp), 0);
         memset(r, 0, sizeof(*r));
-        r->status = mcmc_parse_buf(c->rbuf, c->rbuf_used, &r->resp);
+        r->status = mcmc_parse_buf(rbuf_offset, rbuf_remain, &r->resp);
         if (r->status == MCMC_OK) {
             if (r->resp.vlen != r->resp.vlen_read) {
                 lua_pop(f->L, 1); // throw away the resp object, try re-parsing later
-                mcs_expand_rbuf(c);
+                if (c->rbuf_toconsume != 0) {
+                    // vlen didn't fit, but we are read partway into the
+                    // buffer.
+                    // memmove the buffer and read out.
+                    _mcs_consume_buf(c);
+                } else {
+                    // ... else the read buffer simply wasn't large enough.
+                    mcs_expand_rbuf(c);
+                }
                 ret = 1; // WANT_READ
             } else {
-                r->buf = c->rbuf;
+                r->buf = rbuf_offset;
                 f->lua_nargs = 1;
-                c->rbuf_toconsume = r->resp.reslen + r->resp.vlen_read;
+                c->rbuf_toconsume += r->resp.reslen + r->resp.vlen_read;
 
                 clock_gettime(CLOCK_MONOTONIC, &r->received);
             }
@@ -527,44 +547,46 @@ static int mcs_read_buf(struct mcs_func *f, struct mcs_func_client *c) {
             switch (r->resp.type) {
                 case MCMC_RESP_ERRMSG:
                     if (r->resp.code != MCMC_CODE_SERVER_ERROR) {
-                        fprintf(stderr, "Protocol error, reconnecting: %.*s\n", c->rbuf_used, c->rbuf);
+                        fprintf(stderr, "Protocol error, reconnecting: %.*s\n", rbuf_remain, rbuf_offset);
                         ret = -1;
                     } else {
                         // SERVER_ERROR can be handled upstream
-                        r->buf = f->c.rbuf;
+                        r->buf = rbuf_offset;
                         f->lua_nargs = 1;
-                        c->rbuf_toconsume = r->resp.reslen;
+                        c->rbuf_toconsume += r->resp.reslen;
                         clock_gettime(CLOCK_MONOTONIC, &r->received);
                     }
                     break;
                 case MCMC_RESP_FAIL:
-                    fprintf(stderr, "Read failed, reconnecting: %.*s\n", c->rbuf_used, c->rbuf);
+                    fprintf(stderr, "Read failed, reconnecting: %.*s\n", rbuf_remain, rbuf_offset);
                     ret = -1;
                     break;
                 default:
-                    fprintf(stderr, "Read found garbage, reconnecting: %.*s\n", c->rbuf_used, c->rbuf);
+                    fprintf(stderr, "Read found garbage, reconnecting: %.*s\n", rbuf_remain, rbuf_offset);
                     ret = -1;
             }
         }
     } else {
         // looking for a nonstandard or expanded protocol response line.
-        char *end = memchr(c->rbuf, '\n', c->rbuf_used);
+        char *end = memchr(rbuf_offset, '\n', rbuf_remain);
         if (end != NULL) {
             f->buf_readline = 0;
             // FIXME: making an assumption the minimum read buffer size is
             // always big enough for one line. Could probably add the
             // detection code anyway once I'm sure this works?
-            size_t len = end - c->rbuf + 1;
+            size_t len = end - rbuf_offset + 1;
             c->rbuf_toconsume += len;
             if (len < 2) {
                 fprintf(stderr, "Protocol error, short response: %d\n", (int)len);
                 ret = -1;
             } else {
                 len -= 2; // FIXME: assuming \r\n should be safe.
-                lua_pushlstring(f->L, c->rbuf, len);
+                lua_pushlstring(f->L, rbuf_offset, len);
                 f->lua_nargs = 1;
             }
         } else {
+            // in case we were reading off the end of the data buffer.
+            _mcs_consume_buf(c);
             ret = 1; // WANT_READ
         }
     }
@@ -929,13 +951,8 @@ static int mcslib_write_c(struct mcs_func *f, struct mcs_func_client *c) {
 // "MCMC_WANT_READ" to avoid memmove's in most/many cases.
 // Avoiding this optimization for now for stability.
 static int mcslib_read_c(struct mcs_func_client *c) {
-    // first we need to see how far to move the rbuf, based on the previous
-    // successful read.
-    if (c->rbuf_toconsume != 0) {
-        c->rbuf_used -= c->rbuf_toconsume;
-        if (c->rbuf_used > 0) {
-            memmove(c->rbuf, c->rbuf+c->rbuf_toconsume, c->rbuf_used);
-        }
+    if (c->rbuf_toconsume == c->rbuf_used) {
+        c->rbuf_used = 0;
         c->rbuf_toconsume = 0;
     }
 
