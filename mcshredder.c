@@ -122,6 +122,7 @@ enum mcs_func_state {
     mcs_fstate_rerun,
     mcs_fstate_restart,
     mcs_fstate_syserr,
+    mcs_fstate_sleep,
     mcs_fstate_stop,
 };
 
@@ -129,6 +130,7 @@ enum mcs_lua_yield {
     mcs_luayield_write = 0,
     mcs_luayield_flush,
     mcs_luayield_read,
+    mcs_luayield_sleep,
     mcs_luayield_c_conn,
     mcs_luayield_c_read,
     mcs_luayield_c_readline,
@@ -182,6 +184,7 @@ struct mcs_func {
     struct mcs_f_reconn reconn; // tcp reconnector
     struct mcs_event ev;
     struct mcs_func_client c;
+    struct __kernel_timespec tosleep; // need a stable location for timespecs.
     int limit; // stop running after N loops
     int cqe_res; // result of most recent cqe
     int lua_nargs; // number of args to pass back to lua
@@ -312,6 +315,19 @@ static int _evset_retry_timeout(struct mcs_func *f) {
         return -1;
     }
     io_uring_prep_timeout(sqe, &timeout_retry, 0, 0);
+    io_uring_sqe_set_data(sqe, &f->ev);
+
+    return 0;
+}
+
+static int _evset_sleep(struct mcs_func *f) {
+    struct io_uring_sqe *sqe;
+
+    sqe = io_uring_get_sqe(&f->parent->ring);
+    if (sqe == NULL) {
+        return -1;
+    }
+    io_uring_prep_timeout(sqe, &f->tosleep, 0, 0);
     io_uring_sqe_set_data(sqe, &f->ev);
 
     return 0;
@@ -734,6 +750,14 @@ static int mcs_func_run(void *udata) {
         case mcs_fstate_syserr:
             mcs_syserror(f);
             break;
+        case mcs_fstate_sleep:
+            if (_evset_sleep(f) == 0) {
+                f->state = mcs_fstate_run;
+                stop = true;
+            } else {
+                return -1;
+            }
+            break;
         case mcs_fstate_stop:
             f->parent->active_funcs--;
             stop = true;
@@ -808,6 +832,14 @@ static int mcs_cfunc_run(void *udata) {
         case mcs_fstate_run:
             if (mcs_func_lua(f)) {
                 f->state = mcs_fstate_stop;
+            }
+            break;
+        case mcs_fstate_sleep:
+            if (_evset_sleep(f) == 0) {
+                f->state = mcs_fstate_run;
+                stop = true;
+            } else {
+                return -1;
             }
             break;
         case mcs_fstate_stop:
@@ -914,6 +946,13 @@ static int mcslib_read_c(struct mcs_func_client *c) {
     }
 }
 
+static void mcs_set_sleep(struct mcs_func *f) {
+    lua_State *L = f->L;
+    lua_Integer t = lua_tointeger(L, 1);
+    f->tosleep.tv_sec = t / 1000;
+    f->tosleep.tv_nsec = (t - (f->tosleep.tv_sec * 1000)) * 1000000;
+}
+
 // functions that yield should do minimal work then kick back here for
 // handling.
 // this allows us to avoid passing objects/context around in lua when we want
@@ -948,6 +987,10 @@ static int mcs_func_lua_yield(struct mcs_func *f, int nresults) {
             } else {
                 f->state = mcs_fstate_read;
             }
+            break;
+        case mcs_luayield_sleep:
+            mcs_set_sleep(f);
+            f->state = mcs_fstate_sleep;
             break;
         case mcs_luayield_c_conn:
             f->state = mcs_fstate_connecting;
@@ -1678,6 +1721,11 @@ static int mcslib_read(lua_State *L) {
     return lua_yield(L, 1);
 }
 
+static int mcslib_sleep_millis(lua_State *L) {
+    lua_pushinteger(L, mcs_luayield_sleep);
+    return lua_yield(L, 1);
+}
+
 // A mouthful of a name for a very specific accelerator function.
 // Takes destination client, res object
 static int mcslib_client_write_mgres_to_ms(lua_State *L) {
@@ -2213,6 +2261,7 @@ static void register_lua_libs(lua_State *L) {
         {"run", mcslib_add}, // FIXME: remove this in a week.
         {"shredder", mcslib_shredder},
         {"time_millis", mcslib_time_millis},
+        {"sleep_millis", mcslib_sleep_millis},
         // custom func functions.
         {"client_new", mcslib_client_new},
         {"client_connect", mcslib_client_connect},
