@@ -1737,8 +1737,7 @@ static int mcslib_client_write_mgres_to_ms(lua_State *L) {
     }
 
     // make sure we have headroom in the dest wbuf
-    // FIXME: get proper full length instead of 2k hedge + vlen
-    mcs_expand_wbuf(c, r->resp.vlen + 2048);
+    mcs_expand_wbuf(c, r->resp.reslen + r->resp.vlen);
 
     // find the key token from response
     int x = 1; // index of first flag
@@ -1822,6 +1821,12 @@ static int mcslib_resline(lua_State *L) {
         len -= 2;
     }
     lua_pushlstring(L, r->buf, len);
+    return 1;
+}
+
+static int mcslib_res_len(lua_State *L) {
+    struct mcs_func_resp *r = lua_touserdata(L, -1);
+    lua_pushinteger(L, r->resp.reslen + r->resp.vlen);
     return 1;
 }
 
@@ -2283,6 +2288,7 @@ static void register_lua_libs(lua_State *L) {
         {"res_flagtoken", mcslib_res_flagtoken},
         {"res_stat", mcslib_res_stat},
         {"res_statname", mcslib_res_statname},
+        {"res_len", mcslib_res_len},
         {"match", mcslib_match},
         // request functions.
         {"get", mcslib_get},
