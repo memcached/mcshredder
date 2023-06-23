@@ -2195,6 +2195,14 @@ static int mcslib_ma(lua_State *L) {
     return _mcslib_basic(L, 'a');
 }
 
+static int mcslib_time_millis(lua_State *L) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    lua_Integer t = now.tv_nsec / 1000000 + now.tv_sec * 1000;
+    lua_pushinteger(L, t);
+    return 1;
+}
+
 // TODO: use a differnt lib for main VM vs thread VM's?
 // it should still be fine to use the same source file.
 static void register_lua_libs(lua_State *L) {
@@ -2204,6 +2212,7 @@ static void register_lua_libs(lua_State *L) {
         {"add_custom", mcslib_add_custom},
         {"run", mcslib_add}, // FIXME: remove this in a week.
         {"shredder", mcslib_shredder},
+        {"time_millis", mcslib_time_millis},
         // custom func functions.
         {"client_new", mcslib_client_new},
         {"client_connect", mcslib_client_connect},
