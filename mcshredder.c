@@ -1455,8 +1455,8 @@ static struct mcs_func *mcs_add_custom_func(struct mcs_thread *t) {
 static int mcslib_add_custom(lua_State *L) {
     struct mcs_ctx *ctx = *(struct mcs_ctx **)lua_getextraspace(L);
     struct mcs_thread *t = lua_touserdata(L, 1);
-    //int arg_type = lua_type(L, 3);
     luaL_checktype(L, 2, LUA_TTABLE);
+    int arg_type = lua_type(L, 3);
 
     const char *fname = NULL;
     if (lua_getfield(L, 2, "func") != LUA_TNIL) {
@@ -1467,10 +1467,22 @@ static int mcslib_add_custom(lua_State *L) {
         luaL_error(L, "mcs.add_custom call missing 'func' argument");
     }
 
+    int arg_offset = 0;
+    if (arg_type != LUA_TNONE) {
+        // expects argument table to be in slot -1
+        _mcs_copy_table(L, t->L);
+        arg_offset = lua_absindex(t->L, -1);
+    }
+
     struct mcs_func *f = mcs_add_custom_func(t);
 
     f->fname = strdup(fname);
     memcpy(&f->c.conn, &ctx->conn, sizeof(f->c.conn));
+
+    if (arg_offset) {
+        lua_pushvalue(t->L, arg_offset);
+        f->arg_ref = luaL_ref(t->L, LUA_REGISTRYINDEX);
+    }
 
     return 0;
 }

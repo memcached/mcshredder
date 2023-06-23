@@ -1,12 +1,13 @@
 function config(a)
     local t = mcs.thread()
-    --mcs.add_custom(t, { func = "test" })
-    mcs.add_custom(t, { func = "watch" })
+    mcs.add_custom(t, { func = "test" }, { opt = "foo" })
+    --mcs.add_custom(t, { func = "watch" })
     mcs.shredder({t}, 30)
 end
 
--- TODO: arg passing.
 function test(a)
+    print("received option:", a.opt)
+    mcs.sleep_millis(1000)
     print("creating client")
     -- uses default host/port from commandline if omitted.
     local c = mcs.client_new({ host = "127.0.0.1", port = "11212"})
