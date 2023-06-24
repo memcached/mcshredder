@@ -1,9 +1,6 @@
 -- TODO: top level issues:
--- arg passing for add_custom() to turn below into commandline arguments
 -- implement multiple destination sockets for through-proxy performance.
--- verbose option
 -- per-second stats/progress output like mcdumpload.
--- lua level help output.
 -- destination buffer size limiter.
 -- various error handling for connection retries.
 
@@ -20,7 +17,12 @@ local o = {
 }
 
 local verbose = false
-local key_complete = false
+key_complete = false -- global
+dump_complete = false -- global
+s_keys_listed = 0
+s_keys_sent = 0
+s_bytes_sent = 0
+s_notstored = 0
 
 function say(...)
     if verbose then
@@ -32,6 +34,7 @@ function help()
     local msg =[[
 
 verbose (false) (print extra state information)
+stats (false) (print some stats output every second)
 key_host (127.0.0.1) (host to fetch key list from)
 key_port (11211) (port for above)
 src_host (127.0.0.1) (host to fetch key data from)
@@ -95,7 +98,39 @@ function config(a)
 
     local t = mcs.thread()
     mcs.add_custom(t, { func = "dumpload" }, o)
+    if a.stats then
+        mcs.add_custom(t, { func = "stats" })
+    end
     mcs.shredder({t})
+end
+
+-- since this stats function and the dumpload are using the same OS thread,
+-- they use the same VM and we can share data via globals.
+-- not using a table for the stats for a little extra speed in the dumpload
+-- part.
+function stats()
+    local last_keys_listed = 0
+    local last_keys_sent = 0
+    local last_bytes_sent = 0
+    local last_notstored = 0
+    while dump_complete == false do
+        mcs.sleep_millis(1000)
+        print("===STATS===")
+        print("keys_listed:", s_keys_listed - last_keys_listed)
+        print("keys_sent:", s_keys_sent - last_keys_sent)
+        print("bytes_sent:", s_bytes_sent - last_bytes_sent)
+        print("notstored:", s_notstored - last_notstored)
+        last_keys_listed = s_keys_listed
+        last_keys_sent = s_keys_sent
+        last_bytes_sent = s_bytes_sent
+        last_notstored = s_notstored
+    end
+
+    print("===FINAL STATS===")
+    print("keys_listed:", s_keys_listed)
+    print("keys_sent:", s_keys_sent)
+    print("bytes_sent:", s_bytes_sent)
+    print("notstored:", s_notstored)
 end
 
 function dumpload(a)
@@ -126,6 +161,7 @@ function dumpload(a)
         else
             -- need to remember the first key returned.
             table.insert(keys_in, rline)
+            s_keys_listed = s_keys_listed + 1
             break
         end
     end
@@ -167,10 +203,12 @@ function dumpload(a)
         -- clear the keys queue so we'll fetch another batch.
         keys_in = {}
         if key_complete then
-            print("dump complete")
-            return
+            print("===DUMP=== complete")
+            break
         end
     end
+
+    dump_complete = true
 end
 
 function relax(window_start)
@@ -199,8 +237,11 @@ function send_keys_to_dst(src_c, dst_c, window_start, bw_limit)
             mcs.client_write(dst_c, "mn\r\n")
             break
         else
+            s_keys_sent = s_keys_sent + 1
             mcs.client_write_mgres_to_ms(res, dst_c)
-            sent_bytes = sent_bytes + mcs.res_len(res)
+            local bytes = mcs.res_len(res)
+            sent_bytes = sent_bytes + bytes
+            s_bytes_sent = s_bytes_sent + bytes
         end
         if bw_limit ~= 0 and sent_bytes > bw_limit then
             mcs.client_flush(dst_c)
@@ -218,8 +259,9 @@ function send_keys_to_dst(src_c, dst_c, window_start, bw_limit)
         local rline = mcs.resline(res)
         if rline == "MN" then
             break
+        elseif rline == "NS" then
+            s_notstored = s_notstored + 1
         end
-        -- TODO: else count the NS.
     end
     --print("flushed destination client")
 end
@@ -243,10 +285,11 @@ function read_keys(key_c, keys_in, key_batch_size)
         -- read raw line to avoid protocol parsing
         local rline = mcs.client_readline(key_c)
         if rline == "EN" then
-            print("key read complete")
+            print("===DUMP=== key listing complete")
             key_complete = true
             return
         else
+            s_keys_listed = s_keys_listed + 1
             table.insert(keys_in, rline)
         end
     end
