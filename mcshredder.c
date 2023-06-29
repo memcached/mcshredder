@@ -1827,6 +1827,7 @@ static int mcslib_client_write_mgres_to_ms(lua_State *L) {
                    p++;
                 } else {
                     memcpy(p, token+1, tlen-1);
+                    p += tlen-1;
                 }
                 *p = ' ';
                 p++;
