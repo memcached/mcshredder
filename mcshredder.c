@@ -1116,7 +1116,7 @@ static void mcs_queue_cb(void *udata, struct io_uring_cqe *cqe) {
 }
 
 static void *shredder_thread(void *arg) {
-    struct __kernel_timespec timeout_loop = { .tv_sec = 0, .tv_nsec = 500000000 };
+    struct __kernel_timespec timeout_loop = { .tv_sec = 5, .tv_nsec = 500000000 };
     struct mcs_thread *t = arg;
     t->stop = false;
 
@@ -1158,6 +1158,19 @@ static void *shredder_thread(void *arg) {
         int ret = io_uring_submit_and_wait_timeout(&t->ring, &cqe, 1, &timeout_loop, NULL);
         if (ret < 0) {
             if (t->stop) {
+                // FIXME: if our io uring loop timeout is shorter than a
+                // reschedule time for a function, this can cause the function
+                // to zombify on the next schredder run.
+                // To do this cleanly, we need to:
+                // 1) figure out how to cancel all outstanding requests and/or
+                // reset the ring between runs.
+                // (might be io_uring_prep_cancel() matching on the userdata)
+                // 2) don't reuse the t->funcs list for scheduling, so a
+                // post-stop can properly free the func data instead of
+                // leaking it.
+                // loop all funcs -> issue uring cancellations if not stopped
+                // cleanly -> free data.
+                //
                 // parent told us to stop, but something is hung or not
                 // updating fast enough.
                 break;
