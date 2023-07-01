@@ -1414,7 +1414,11 @@ static int mcslib_add(lua_State *L) {
             if (start_rate != 0) {
                 uint64_t start_offset = start_rate * x;
                 f->rate.start.tv_sec = start_offset / NSEC_PER_SEC;
-                f->rate.start.tv_nsec = start_offset - (f->rate.start.tv_sec * NSEC_PER_SEC);
+                if (start_offset > NSEC_PER_SEC) {
+                    f->rate.start.tv_nsec = start_offset - (f->rate.start.tv_sec * NSEC_PER_SEC);
+                } else {
+                    f->rate.start.tv_nsec = start_offset;
+                }
             }
             f->reconn = freconn;
             // first run counts against the limiter
