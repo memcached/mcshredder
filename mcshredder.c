@@ -815,6 +815,9 @@ static int mcs_cfunc_run(void *udata) {
                 mcmc_disconnect(c->mcmc);
                 lua_pushboolean(f->L, 0);
                 f->lua_nargs = 1;
+            } else {
+                lua_pushboolean(f->L, 1);
+                f->lua_nargs = 1;
             }
             f->state = mcs_fstate_run;
             break;
