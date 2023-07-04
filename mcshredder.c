@@ -580,7 +580,11 @@ static int mcs_read_buf(struct mcs_func *f, struct mcs_func_client *c) {
                 fprintf(stderr, "Protocol error, short response: %d\n", (int)len);
                 ret = -1;
             } else {
-                len -= 2; // FIXME: assuming \r\n should be safe.
+                if (*(end-2) == '\r') {
+                    len -= 2;
+                } else {
+                    len--;
+                }
                 lua_pushlstring(f->L, rbuf_offset, len);
                 f->lua_nargs = 1;
             }
