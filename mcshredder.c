@@ -1529,7 +1529,6 @@ static struct mcs_func *mcs_add_custom_func(struct mcs_thread *t) {
     return f;
 }
 
-// TODO: add the argument table.
 static int mcslib_add_custom(lua_State *L) {
     struct mcs_ctx *ctx = *(struct mcs_ctx **)lua_getextraspace(L);
     struct mcs_thread *t = lua_touserdata(L, 1);
@@ -1585,8 +1584,12 @@ static void _mcs_cleanup_thread(struct mcs_thread *t) {
     }
     STAILQ_INIT(&t->func_list);
     STAILQ_INIT(&t->func_runlist);
-    // TODO: run the lua VM GC a couple times to kick free any pending
+    // run the lua VM GC a couple times to kick free any pending
     // objects.
+    lua_gc(t->L, LUA_GCCOLLECT);
+    lua_gc(t->L, LUA_GCCOLLECT);
+    // "have you turned it off on and again?" "uhhhuh." "three times?"
+    lua_gc(t->L, LUA_GCCOLLECT);
 
     // NOTE: attempting to make threads re-usable, so we leave the VM open.
     // lua_close(t->L);
@@ -1741,6 +1744,8 @@ static int mcslib_client_new(lua_State *L) {
     luaL_checktype(L, 1, LUA_TTABLE);
     struct mcs_func_client *c = lua_newuserdatauv(L, sizeof(struct mcs_func_client), 0);
     memset(c, 0, sizeof(*c));
+    luaL_getmetatable(L, "mcs.client");
+    lua_setmetatable(L, -2);
 
     // seed the socket parameters and allow overrides.
     memcpy(&c->conn, &t->ctx->conn, sizeof(t->ctx->conn));
@@ -2372,6 +2377,19 @@ static int mcslib_time_millis(lua_State *L) {
     return 1;
 }
 
+static int mcslib_client_gc(lua_State *L) {
+    struct mcs_func_client *c = luaL_checkudata(L, -1, "mcs.client");
+    // check routine just in case GC is called multiple times.
+    if (c->mcmc) {
+        mcmc_disconnect(c->mcmc);
+        free(c->rbuf);
+        free(c->wbuf);
+        free(c->mcmc);
+        c->mcmc = NULL;
+    }
+    return 0;
+}
+
 // TODO: use a differnt lib for main VM vs thread VM's?
 // it should still be fine to use the same source file.
 static void register_lua_libs(lua_State *L) {
@@ -2417,6 +2435,17 @@ static void register_lua_libs(lua_State *L) {
         {"ma", mcslib_ma},
         {NULL, NULL}
     };
+
+    const struct luaL_Reg mcs_client_m [] = {
+        {"__gc", mcslib_client_gc},
+        {NULL, NULL}
+    };
+
+    luaL_newmetatable(L, "mcs.client");
+    lua_pushvalue(L, -1); // duplicate metatable.
+    lua_setfield(L, -2, "__index"); // mt.__index = mt
+    luaL_setfuncs(L, mcs_client_m, 0); // register methods
+    lua_pop(L, 1); // drop metatable
 
     luaL_newlibtable(L, mcs_f);
     luaL_setfuncs(L, mcs_f, 0);
