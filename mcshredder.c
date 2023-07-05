@@ -175,10 +175,12 @@ struct mcs_func {
     int self_ref; // avoid garbage collection
     int self_ref_coro; // reference for the coroutine thread
     int arg_ref; // reference for function argument
-    STAILQ_ENTRY(mcs_func) next; // coroutine stack
+    STAILQ_ENTRY(mcs_func) next_run; // coroutine run stack.
+    STAILQ_ENTRY(mcs_func) next_func; // total live list.
     struct mcs_thread *parent; // pointer back to owner thread
     char *fname; // name of function to call
     bool linked;
+    bool active;
     enum mcs_func_state state;
     struct mcs_f_rate rate; // rate limiter
     struct mcs_f_reconn reconn; // tcp reconnector
@@ -197,7 +199,8 @@ struct mcs_thread {
     struct mcs_ctx *ctx;
     lua_State *L; // lua VM local to this thread
     STAILQ_ENTRY(mcs_thread) next; // thread stack
-    func_head_t funcs; // coroutine stack
+    func_head_t func_runlist; // queued runlist
+    func_head_t func_list; // coroutine stack
     int active_funcs; // stop if no active functions
     struct io_uring ring;
     pthread_t tid;
@@ -412,6 +415,20 @@ static int _evset_read(struct mcs_func *f, struct mcs_func_client *c) {
 
         return -1;
     }
+
+    return 0;
+}
+
+static int _evset_cancel(struct mcs_func *f) {
+    struct io_uring_sqe *sqe;
+
+    sqe = io_uring_get_sqe(&f->parent->ring);
+    if (sqe == NULL) {
+        return -1;
+    }
+
+    io_uring_prep_cancel(sqe, &f->ev, 0);
+    io_uring_sqe_set_data(sqe, &f->ev);
 
     return 0;
 }
@@ -786,6 +803,7 @@ static int mcs_func_run(void *udata) {
             break;
         case mcs_fstate_stop:
             f->parent->active_funcs--;
+            f->active = false;
             stop = true;
             break;
         default:
@@ -873,6 +891,7 @@ static int mcs_cfunc_run(void *udata) {
             break;
         case mcs_fstate_stop:
             f->parent->active_funcs--;
+            f->active = false;
             stop = true;
             break;
         default:
@@ -1118,14 +1137,46 @@ static void mcs_start_limiter(struct mcs_func *f) {
 static void mcs_queue_cb(void *udata, struct io_uring_cqe *cqe) {
     struct mcs_func *f = udata;
     f->cqe_res = cqe->res;
-    STAILQ_INSERT_TAIL(&f->parent->funcs, f, next);
+    STAILQ_INSERT_TAIL(&f->parent->func_runlist, f, next_run);
     f->linked = true;
 }
 
+// alternative cooldown function for cancelling and stopping active funcs with
+// outstanding waits (either hung, timers, or non-exiting loops).
+// there's some structure here for the types of return codes I observed in
+// case I feel like filling them in or handling this differently.
+// Currently we send cancellations until ENOENT comes back, but if I have more
+// faith in my understanding of io_uring we could stop after the matching
+// ECANCELED is found.
+// NOTE: This loop is imperfect: if we want to immediately cancel we may need
+// an extra bool on "cancellation sent" so it won't double up in a loop? I see
+// what looks like data corruption when I avoid waiting for the io_uring
+// timeout to stop. It doesn't happen if we wait so I'm leaving this note for
+// the next time I feel like investigating io_uring esoterics.
+static void mcs_close_cb(void *udata, struct io_uring_cqe *cqe) {
+    struct mcs_func *f = udata;
+    if (cqe->res == -ENOENT) {
+        if (f->active) {
+            f->parent->active_funcs--;
+            f->active = false;
+        }
+    } else if (cqe->res == -EALREADY) {
+        // original request is already on its way back.
+    } else if (cqe->res == -ECANCELED) {
+        // this was the cqe for the original request.
+        // there should only be one; our cancellation request resulted in this
+        // cqe, so far as I can tell.
+    } else {
+        // some unknown error.
+    }
+}
+
 static void *shredder_thread(void *arg) {
-    struct __kernel_timespec timeout_loop = { .tv_sec = 5, .tv_nsec = 500000000 };
+    struct __kernel_timespec timeout_loop = { .tv_sec = 0, .tv_nsec = 500000000 };
     struct mcs_thread *t = arg;
     t->stop = false;
+    func_head_t fhead; // temporary func stack.
+    STAILQ_INIT(&fhead);
 
     // uring core loop
     while (1) {
@@ -1142,16 +1193,17 @@ static void *shredder_thread(void *arg) {
         }
 
         io_uring_cq_advance(&t->ring, count);
+        STAILQ_CONCAT(&fhead, &t->func_runlist);
 
         // call queue any queue callbacks
-        while (!STAILQ_EMPTY(&t->funcs)) {
-            struct mcs_func *f = STAILQ_FIRST(&t->funcs);
-            STAILQ_REMOVE_HEAD(&t->funcs, next);
+        while (!STAILQ_EMPTY(&fhead)) {
+            struct mcs_func *f = STAILQ_FIRST(&fhead);
+            STAILQ_REMOVE_HEAD(&fhead, next_run);
             f->linked = false;
             int res = f->ev.qcb(f);
             if (res == -1) {
                 // failed to get SQE's, need to continue the list later.
-                STAILQ_INSERT_HEAD(&t->funcs, f, next);
+                STAILQ_INSERT_HEAD(&t->func_runlist, f, next_run);
                 break;
             }
         }
@@ -1162,25 +1214,16 @@ static void *shredder_thread(void *arg) {
 
         // TODO: this returns number of cqe and populates cqe array so we can
         // restructure the above loop too?
-        int ret = io_uring_submit_and_wait_timeout(&t->ring, &cqe, 1, &timeout_loop, NULL);
-        if (ret < 0) {
-            if (t->stop) {
-                // FIXME: if our io uring loop timeout is shorter than a
-                // reschedule time for a function, this can cause the function
-                // to zombify on the next schredder run.
-                // To do this cleanly, we need to:
-                // 1) figure out how to cancel all outstanding requests and/or
-                // reset the ring between runs.
-                // (might be io_uring_prep_cancel() matching on the userdata)
-                // 2) don't reuse the t->funcs list for scheduling, so a
-                // post-stop can properly free the func data instead of
-                // leaking it.
-                // loop all funcs -> issue uring cancellations if not stopped
-                // cleanly -> free data.
-                //
-                // parent told us to stop, but something is hung or not
-                // updating fast enough.
-                break;
+        int res = io_uring_submit_and_wait_timeout(&t->ring, &cqe, 1, &timeout_loop, NULL);
+        if (res < 0 && t->stop) {
+            struct mcs_func *f = NULL;
+            // parent told us to stop.
+            // insert cancellation requests so we can close the funcs.
+            STAILQ_FOREACH(f, &t->func_list, next_func) {
+                if (f->active) {
+                    f->ev.cb = mcs_close_cb;
+                    _evset_cancel(f);
+                }
             }
         }
     }
@@ -1199,7 +1242,8 @@ static int mcslib_thread(lua_State *L) {
     struct mcs_ctx *ctx = *(struct mcs_ctx **)lua_getextraspace(L);
 
     struct mcs_thread *t = lua_newuserdatauv(ctx->L, sizeof(struct mcs_thread), 0);
-    STAILQ_INIT(&t->funcs);
+    STAILQ_INIT(&t->func_runlist);
+    STAILQ_INIT(&t->func_list);
 
     t->ctx = ctx;
     t->active_funcs = 0;
@@ -1225,8 +1269,10 @@ static struct mcs_func *mcs_add_func(struct mcs_thread *t) {
     // create coroutine using thread VM.
     struct mcs_func *f = lua_newuserdatauv(t->L, sizeof(struct mcs_func), 0);
     memset(f, 0, sizeof(struct mcs_func));
-    STAILQ_INSERT_TAIL(&t->funcs, f, next);
+    STAILQ_INSERT_TAIL(&t->func_runlist, f, next_run);
+    STAILQ_INSERT_TAIL(&t->func_list, f, next_func);
     t->active_funcs++;
+    f->active = true;
 
     f->parent = t;
 
@@ -1458,9 +1504,11 @@ static struct mcs_func *mcs_add_custom_func(struct mcs_thread *t) {
     // create coroutine using thread VM.
     struct mcs_func *f = lua_newuserdatauv(t->L, sizeof(struct mcs_func), 0);
     memset(f, 0, sizeof(struct mcs_func));
-    STAILQ_INSERT_TAIL(&t->funcs, f, next);
+    STAILQ_INSERT_TAIL(&t->func_runlist, f, next_run);
+    STAILQ_INSERT_TAIL(&t->func_list, f, next_func);
     t->active_funcs++;
 
+    f->active = true;
     f->parent = t;
 
     // prepare the function's coroutine
@@ -1520,17 +1568,26 @@ static int mcslib_add_custom(lua_State *L) {
 static void _mcs_cleanup_thread(struct mcs_thread *t) {
     struct mcs_func *f = NULL;
 
-    STAILQ_FOREACH(f, &t->funcs, next) {
-        mcmc_disconnect(f->c.mcmc);
+    STAILQ_FOREACH(f, &t->func_list, next_func) {
+        if (f->c.mcmc) {
+            mcmc_disconnect(f->c.mcmc);
+        }
         free(f->c.rbuf);
         free(f->c.wbuf);
         free(f->c.mcmc);
         free(f->fname);
+        // TODO: if we upgrade to 5.4.6 use closethread instead. resetthread
+        // is deprecated.
+        lua_resetthread(f->L);
         luaL_unref(t->L, LUA_REGISTRYINDEX, f->self_ref);
         luaL_unref(t->L, LUA_REGISTRYINDEX, f->self_ref_coro);
         // do not free the function: it's owned by the lua state
     }
-    STAILQ_INIT(&t->funcs);
+    STAILQ_INIT(&t->func_list);
+    STAILQ_INIT(&t->func_runlist);
+    // TODO: run the lua VM GC a couple times to kick free any pending
+    // objects.
+
     // NOTE: attempting to make threads re-usable, so we leave the VM open.
     // lua_close(t->L);
     // io_uring_queue_exit(&t->ring);
