@@ -597,7 +597,7 @@ static int mcs_read_buf(struct mcs_func *f, struct mcs_func_client *c) {
                 fprintf(stderr, "Protocol error, short response: %d\n", (int)len);
                 ret = -1;
             } else {
-                if (*(end-2) == '\r') {
+                if (*(end-1) == '\r') {
                     len -= 2;
                 } else {
                     len--;

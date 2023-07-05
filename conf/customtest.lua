@@ -1,7 +1,7 @@
 function config(a)
     local t = mcs.thread()
-    mcs.add_custom(t, { func = "test" }, { opt = "foo" })
-    --mcs.add_custom(t, { func = "watch" })
+    --mcs.add_custom(t, { func = "test" }, { opt = "foo" })
+    mcs.add_custom(t, { func = "watch" })
     mcs.shredder({t}, 30)
 end
 
