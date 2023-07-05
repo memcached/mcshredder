@@ -1625,18 +1625,20 @@ static int mcslib_shredder(lua_State *L) {
         }
     }
 
-    int type = lua_type(L, -1);
+    int type = lua_type(L, 2);
     struct timespec wait;
     bool use_wait = false;;
 
     if (type == LUA_TNUMBER) {
-        int tosleep = lua_tointeger(L, -1);
+        int tosleep = lua_tointeger(L, 2);
         if (tosleep != 0) {
             clock_gettime(CLOCK_REALTIME, &wait);
             wait.tv_nsec = 0;
             wait.tv_sec += tosleep;
             use_wait = true;
         }
+    } else if (type != LUA_TNONE && type != LUA_TNIL) {
+        return luaL_error(L, "second argument to mcs.shredder must be numeric");
     }
 
     while (ctx->active_threads) {
