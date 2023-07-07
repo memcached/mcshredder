@@ -1,8 +1,6 @@
 -- TODO: top level issues:
 -- implement multiple destination sockets for through-proxy performance.
--- per-second stats/progress output like mcdumpload.
 -- destination buffer size limiter.
--- various error handling for connection retries.
 
 local DEFAULT_HOST = "127.0.0.1"
 local DEFAULT_PORT = "11211"
@@ -19,6 +17,7 @@ local o = {
 local verbose = false
 key_complete = false -- global
 dump_complete = false -- global
+dump_started = false -- global
 s_keys_listed = 0
 s_keys_sent = 0
 s_bytes_sent = 0
@@ -113,6 +112,13 @@ function stats()
     local last_keys_sent = 0
     local last_bytes_sent = 0
     local last_notstored = 0
+    while dump_started == false do
+        mcs.sleep_millis(100)
+        -- so we don't print random junk if the dump doesn't even start.
+        if dump_complete then
+            return
+        end
+    end
     while dump_complete == false do
         mcs.sleep_millis(1000)
         print("===STATS===")
@@ -134,20 +140,35 @@ function stats()
 end
 
 function dumpload(a)
-    local keys_in = {}
+    dumpload_run(a)
+    dump_complete = true
+end
 
-    print("key host:", a.key_host["host"])
-    print("key port:", a.key_host["port"])
-    mcs.sleep_millis(5000)
+function dumpload_run(a)
+    local keys_in = {}
+    verbose = a.verbose
+
+    say("key host:", a.key_host["host"])
+    say("key port:", a.key_host["port"])
+    --mcs.sleep_millis(5000)
     local key_c = mcs.client_new(a.key_host)
     -- TODO: error handling.
-    mcs.client_connect(key_c)
+    if not mcs.client_connect(key_c) then
+        print("ERROR: Failed to connect to key dump source")
+        return
+    end
     say("keylist socket connected")
     local src_c = mcs.client_new(a.src_host)
-    mcs.client_connect(src_c)
+    if not mcs.client_connect(src_c) then
+        print("ERROR: Failed to connet to data source")
+        return
+    end
     say("source socket connected")
     local dst_c = mcs.client_new(a.dst_host)
-    mcs.client_connect(dst_c)
+    if not mcs.client_connect(dst_c) then
+        print("ERROR: Failed to connect to destination")
+        return
+    end
     say("destination socket connected")
 
     for x=1,a.startwait do
@@ -167,6 +188,7 @@ function dumpload(a)
     end
 
     say("dump started")
+    dump_started = true
 
     local key_batch_size = a.key_batch_size
     local bw_rate_limit = 0
@@ -207,8 +229,6 @@ function dumpload(a)
             break
         end
     end
-
-    dump_complete = true
 end
 
 function relax(window_start)
@@ -227,7 +247,10 @@ function send_keys_to_dst(src_c, dst_c, window_start, bw_limit)
     -- allocations and data copies.
     local sent_bytes = 0
     while true do
-        local res = mcs.client_read(src_c)
+        local res, err = mcs.client_read(src_c)
+        if res == nil then
+            error("ERROR: reading from data source failed: " .. err)
+        end
         local rline = mcs.resline(res)
         --print("result line from source:", rline)
         -- TODO: c func for asking if this res is an MN instead of copying the
@@ -252,10 +275,16 @@ function send_keys_to_dst(src_c, dst_c, window_start, bw_limit)
     end
 
     -- write outstanding bytes to the network socket.
-    mcs.client_flush(dst_c)
+    local success, err = mcs.client_flush(dst_c)
+    if not success then
+        error("ERROR: flushing requests to dest failed: " .. err)
+    end
     -- confirm batch was sent.
     while true do
-        local res = mcs.client_read(dst_c)
+        local res, err = mcs.client_read(dst_c)
+        if res == nil then
+            error("ERROR: reading response from dest failed: " .. err)
+        end
         local rline = mcs.resline(res)
         if rline == "MN" then
             break
@@ -273,7 +302,10 @@ function request_src_keys(src_c, keys_in)
     end
     -- send end cap for this batch.
     mcs.client_write(src_c, "mn\r\n")
-    mcs.client_flush(src_c)
+    local success, err = mcs.client_flush(src_c)
+    if not success then
+        error("ERROR: flushing requests to data source: " .. err)
+    end
 end
 
 function read_keys(key_c, keys_in, key_batch_size)
@@ -283,8 +315,10 @@ function read_keys(key_c, keys_in, key_batch_size)
 
     while #keys_in < key_batch_size do
         -- read raw line to avoid protocol parsing
-        local rline = mcs.client_readline(key_c)
-        if rline == "EN" then
+        local rline, err = mcs.client_readline(key_c)
+        if rline == nil then
+            error("ERROR: key dump read failed: " .. err)
+        elseif rline == "EN" then
             print("===DUMP=== key listing complete")
             key_complete = true
             return
