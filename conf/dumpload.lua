@@ -22,6 +22,7 @@ s_keys_listed = 0
 s_keys_sent = 0
 s_bytes_sent = 0
 s_notstored = 0
+s_server_error = 0
 
 function say(...)
     if verbose then
@@ -112,6 +113,7 @@ function stats()
     local last_keys_sent = 0
     local last_bytes_sent = 0
     local last_notstored = 0
+    local last_server_error = 0
     while dump_started == false do
         mcs.sleep_millis(100)
         -- so we don't print random junk if the dump doesn't even start.
@@ -126,10 +128,12 @@ function stats()
         print("keys_sent:", s_keys_sent - last_keys_sent)
         print("bytes_sent:", s_bytes_sent - last_bytes_sent)
         print("notstored:", s_notstored - last_notstored)
+        print("server_error:", s_server_error - last_server_error)
         last_keys_listed = s_keys_listed
         last_keys_sent = s_keys_sent
         last_bytes_sent = s_bytes_sent
         last_notstored = s_notstored
+        last_server_error = s_server_error
     end
 
     print("===FINAL STATS===")
@@ -137,6 +141,7 @@ function stats()
     print("keys_sent:", s_keys_sent)
     print("bytes_sent:", s_bytes_sent)
     print("notstored:", s_notstored)
+    print("sever_error:", s_server_error)
 end
 
 function dumpload(a)
@@ -290,6 +295,19 @@ function send_keys_to_dst(src_c, dst_c, window_start, bw_limit)
             break
         elseif rline == "NS" then
             s_notstored = s_notstored + 1
+        else
+            -- Some sort of error.
+            local t = mcs.res_split(res)
+            -- FIXME: need internal fixes before the non-SE sections below can
+            -- work. The destination read will fail earlier than this code.
+            if t[1] == "SERVER_ERROR" then
+                s_server_error = s_server_error + 1
+                print(rline)
+            elseif t[1] == "CLIENT_ERROR" or t[1] == "CLIENT_ERROR" or t[1] == "ERROR" then
+                error("ERROR: must stop, protocol error: " .. rline)
+            else
+                error("ERROR: garbage received from dest: " .. rline)
+            end
         end
     end
     --print("flushed destination client")
