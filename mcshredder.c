@@ -168,6 +168,7 @@ struct mcs_func_client {
     size_t rbuf_size;
     int rbuf_used;
     int rbuf_toconsume; // how far to skip rbuf on next read.
+    bool connected;
 };
 
 struct mcs_func {
@@ -626,7 +627,7 @@ static void mcs_postread(struct mcs_func *f, struct mcs_func_client *c) {
         } else if (ret == 1) {
             f->state = mcs_fstate_read;
         } else if (ret < 0) {
-            f->reserr = 1;
+            f->reserr = ret;
             f->state = mcs_fstate_syserr;
         }
     } else if (res < 0) {
@@ -636,7 +637,7 @@ static void mcs_postread(struct mcs_func *f, struct mcs_func_client *c) {
             fprintf(stderr, "Unexpectedly could not read from socket, please report this\n");
             abort();
         } else {
-            f->reserr = 0;
+            f->reserr = res;
             f->state = mcs_fstate_syserr;
         }
     } else if (res == 0) {
@@ -662,6 +663,7 @@ static int mcs_reschedule(struct mcs_func *f) {
 
 static void mcs_syserror(struct mcs_func *f) {
     mcmc_disconnect(f->c.mcmc);
+    f->c.connected = false;
     if (f->reserr == 0) {
         fprintf(stderr, "%s: conn gracefully disconnected\n", f->fname);
     } else {
@@ -694,6 +696,7 @@ static void mcs_restart(struct mcs_func *f) {
         f->reconn.after--;
         if (f->reconn.after == 0) {
             mcmc_disconnect(f->c.mcmc);
+            f->c.connected = false;
             f->reconn.after = f->reconn.every;
             f->state = mcs_fstate_disconn;
             return;
@@ -701,6 +704,7 @@ static void mcs_restart(struct mcs_func *f) {
     }
     if (f->parent->stop) {
         mcmc_disconnect(f->c.mcmc);
+        f->c.connected = false;
         f->state = mcs_fstate_stop;
         return;
     }
@@ -721,6 +725,7 @@ static int mcs_func_run(void *udata) {
                 f->state = mcs_fstate_connecting;
             } else {
                 mcmc_disconnect(f->c.mcmc);
+                f->c.connected = false;
                 f->state = mcs_fstate_retry;
             }
             break;
@@ -734,8 +739,10 @@ static int mcs_func_run(void *udata) {
         case mcs_fstate_postconnect:
             if (mcmc_check_nonblock_connect(f->c.mcmc, &err) != MCMC_OK) {
                 mcmc_disconnect(f->c.mcmc);
+                f->c.connected = false;
                 f->state = mcs_fstate_retry;
             } else {
+                f->c.connected = true;
                 mcs_start_limiter(f);
                 f->state = mcs_fstate_rerun;
             }
@@ -835,9 +842,11 @@ static int mcs_cfunc_run(void *udata) {
             c = lua_touserdata(f->L, 1);
             if (mcmc_check_nonblock_connect(c->mcmc, &err) != MCMC_OK) {
                 mcmc_disconnect(c->mcmc);
+                c->connected = false;
                 lua_pushboolean(f->L, 0);
                 f->lua_nargs = 1;
             } else {
+                c->connected = true;
                 lua_pushboolean(f->L, 1);
                 f->lua_nargs = 1;
             }
@@ -845,7 +854,13 @@ static int mcs_cfunc_run(void *udata) {
             break;
         case mcs_fstate_read:
             c = lua_touserdata(f->L, 1);
-            if (_evset_read(f, c) == 0) {
+            if (!c->connected) {
+                lua_pushnil(f->L);
+                // FIXME: get a real error in here.
+                lua_pushinteger(f->L, -1);
+                f->lua_nargs = 2;
+                f->state = mcs_fstate_run;
+            } else if (_evset_read(f, c) == 0) {
                 f->state = mcs_fstate_postread;
                 stop = true;
             } else {
@@ -858,7 +873,12 @@ static int mcs_cfunc_run(void *udata) {
             break;
         case mcs_fstate_flush:
             c = lua_touserdata(f->L, 1);
-            if (_evset_wrflush(f, c) == 0) {
+            if (!c->connected) {
+                lua_pushboolean(f->L, 0);
+                lua_pushinteger(f->L, 0);
+                f->lua_nargs = 2;
+                f->state = mcs_fstate_run;
+            } else if (_evset_wrflush(f, c) == 0) {
                 f->state = mcs_fstate_postflush;
                 stop = true;
             } else {
@@ -872,8 +892,11 @@ static int mcs_cfunc_run(void *udata) {
         case mcs_fstate_syserr:
             c = lua_touserdata(f->L, 1);
             mcmc_disconnect(c);
+            c->connected = false;
             // FIXME: need better way to communicate client has errored.
+            lua_pushnil(f->L);
             lua_pushinteger(f->L, f->reserr);
+            f->lua_nargs = 2;
             f->state = mcs_fstate_run;
             break;
         case mcs_fstate_run:
@@ -1050,7 +1073,7 @@ static int mcs_func_lua_yield(struct mcs_func *f, int nresults) {
                 } else if (ret == 1) {
                     f->state = mcs_fstate_read;
                 } else if (ret < 0) {
-                    f->reserr = 1;
+                    f->reserr = ret;
                     f->state = mcs_fstate_syserr;
                 }
             } else {
