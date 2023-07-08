@@ -1,6 +1,6 @@
 -- TODO: top level issues:
--- implement multiple destination sockets for through-proxy performance.
 -- destination buffer size limiter.
+-- data retry...
 
 local DEFAULT_HOST = "127.0.0.1"
 local DEFAULT_PORT = "11211"
@@ -24,6 +24,18 @@ s_keys_sent = 0
 s_bytes_sent = 0
 s_notstored = 0
 s_server_error = 0
+
+-- INTERNAL GLOBALS
+-- to parallelize writing data to and verifying responses with destination
+-- connections, we use more coroutines. These globals are used for signalling
+-- and passing the destination sockets to the other coroutines.
+-- a short sleep is currently used for polling, but wait-and-wake semantics
+-- should be pretty easy to pull off to remove this.
+--
+-- Even with just the sleep the performance seems to nearly match mcdumpload's
+-- multi-dest sockets.
+g_dst_conns = {}
+g_dst_flushing = {}
 
 function say(...)
     if verbose then
@@ -98,12 +110,15 @@ function config(a)
     end
     if a.dst_conns then
         say("overriding destination connection limit:", a.dst_conns)
-        o.dst_conns = a.dst_conns
+        o.dst_conns = tonumber(a.dst_conns)
     end
     say("completed argument parsing")
 
     local t = mcs.thread()
     mcs.add_custom(t, { func = "dumpload" }, o)
+    for x=1,o.dst_conns do
+        mcs.add_custom(t, { func = "destwriter" }, { idx = x })
+    end
     if a.stats then
         mcs.add_custom(t, { func = "stats" })
     end
@@ -183,6 +198,7 @@ function dumpload_run(a)
             return
         end
         dst_conns[x] = dst_c
+        g_dst_conns[x] = dst_c
     end
     say("destination sockets connected:", #dst_conns)
 
@@ -244,6 +260,21 @@ function dumpload_run(a)
             break
         end
     end
+
+    -- wait for any flushing destinations to complete.
+    while true do
+        local done = true
+        for x=1,#dst_conns do
+           if g_dst_flushing[x] then
+               done = false
+           end
+       end
+       if done then
+           break
+       else
+           mcs.sleep_millis(1)
+       end
+    end
 end
 
 function relax(window_start)
@@ -262,11 +293,27 @@ function send_keys_to_dst(src_c, dst_conns, window_start, bw_limit)
     -- called, so we cannot stack them. This is done to avoid extra large
     -- allocations and data copies.
     local sent_bytes = 0
-    local idx = 1
+    local idx = 0
+    local dst_c = nil
+    while true do
+        for x=1,#dst_conns do
+            -- find first available destination connection
+            if not g_dst_flushing[x] then
+                dst_c = dst_conns[x]
+                idx = x
+                break
+            end
+        end
+
+        if dst_c ~= nil then
+            break
+        else
+            -- didn't find a free destination socket.
+            mcs.sleep_millis(1)
+        end
+    end
 
     while true do
-        local dst_c = dst_conns[idx % #dst_conns + 1]
-        idx = idx + 1
         local res, err = mcs.client_read(src_c)
         if res == nil then
             error("ERROR: reading from data source failed: " .. err)
@@ -286,55 +333,75 @@ function send_keys_to_dst(src_c, dst_conns, window_start, bw_limit)
             s_bytes_sent = s_bytes_sent + bytes
         end
         if bw_limit ~= 0 and sent_bytes > bw_limit then
-            for x=1,#dst_conns do
-                mcs.client_flush(dst_conns[x])
-            end
+            mcs.client_flush(dst_c)
             relax(window_start)
             window_start = mcs.time_millis()
             sent_bytes = 0
         end
     end
 
-    -- write outstanding bytes to the network socket.
-    for x=1,#dst_conns do
-        local dst_c = dst_conns[x]
-        mcs.client_write(dst_c, "mn\r\n")
-        local success, err = mcs.client_flush(dst_c)
-        if not success then
-            error("ERROR: flushing requests to dest failed: " .. err)
-        end
+    -- mark destination connection as ready to flush.
+    -- coroutine will pick it up
+    g_dst_flushing[idx] = true
+
+    --print("flushed destination client")
+end
+
+-- separate coroutine function for flushing to destination sockets.
+function destwriter(o)
+    local idx = o.idx
+    while not dump_started do
+        mcs.sleep_millis(10)
     end
 
-    -- confirm batch was sent.
-    for x=1,#dst_conns do
-        local dst_c = dst_conns[x]
-        while true do
-            local res, err = mcs.client_read(dst_c)
-            if res == nil then
-                error("ERROR: reading response from dest failed: " .. err)
-            end
-            local rline = mcs.resline(res)
-            if rline == "MN" then
-                break
-            elseif rline == "NS" then
-                s_notstored = s_notstored + 1
+    while true do
+        if not g_dst_flushing[idx] then
+            mcs.sleep_millis(1)
+        else
+            dest_flush(g_dst_conns[idx])
+            g_dst_flushing[idx] = false
+        end
+
+        if dump_complete then
+            break
+        end
+    end
+end
+
+-- actually handles flushing
+function dest_flush(dst_c)
+    -- cap the write and flush
+    mcs.client_write(dst_c, "mn\r\n")
+    local success, err = mcs.client_flush(dst_c)
+    if not success then
+        error("ERROR: flushing requests to dest failed: " .. err)
+    end
+
+    while true do
+        local res, err = mcs.client_read(dst_c)
+        if res == nil then
+            error("ERROR: reading response from dest failed: " .. err)
+        end
+        local rline = mcs.resline(res)
+        if rline == "MN" then
+            break
+        elseif rline == "NS" then
+            s_notstored = s_notstored + 1
+        else
+            -- Some sort of error.
+            local t = mcs.res_split(res)
+            -- FIXME: need internal fixes before the non-SE sections below can
+            -- work. The destination read will fail earlier than this code.
+            if t[1] == "SERVER_ERROR" then
+                s_server_error = s_server_error + 1
+                print(rline)
+            elseif t[1] == "CLIENT_ERROR" or t[1] == "CLIENT_ERROR" or t[1] == "ERROR" then
+                error("ERROR: must stop, protocol error: " .. rline)
             else
-                -- Some sort of error.
-                local t = mcs.res_split(res)
-                -- FIXME: need internal fixes before the non-SE sections below can
-                -- work. The destination read will fail earlier than this code.
-                if t[1] == "SERVER_ERROR" then
-                    s_server_error = s_server_error + 1
-                    print(rline)
-                elseif t[1] == "CLIENT_ERROR" or t[1] == "CLIENT_ERROR" or t[1] == "ERROR" then
-                    error("ERROR: must stop, protocol error: " .. rline)
-                else
-                    error("ERROR: garbage received from dest: " .. rline)
-                end
+                error("ERROR: garbage received from dest: " .. rline)
             end
         end
     end
-    --print("flushed destination client")
 end
 
 function request_src_keys(src_c, keys_in)
