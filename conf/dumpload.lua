@@ -8,6 +8,7 @@ local o = {
     key_host = { host = DEFAULT_HOST, port = DEFAULT_PORT },
     src_host = { host = DEFAULT_HOST, port = DEFAULT_PORT },
     dst_host = { host = DEFAULT_HOST, port = DEFAULT_PORT },
+    dst_conns = 1,
     startwait = 10,
     key_batch_size = 1000,
     key_rate_limit = 0,
@@ -45,6 +46,7 @@ startwait (10) (seconds to wait for key item stream to start)
 key_batch_size (1000) (number of keys to fetch from source at once)
 key_rate_limit (0) (max number of keys to process per second)
 bw_rate_limit (0) (max number of kilobits to transfer per second)
+dst_conns (1) (number of destination sockets to use)
     ]]
     print(msg)
 end
@@ -84,7 +86,7 @@ function config(a)
     end
     if a.batch_size then
         say("overriding key batch size:", a.batch_size)
-        o.key_batch_size = a.batch_size
+        o.key_batch_size = tonumber(a.batch_size)
     end
     if a.key_rate_limit then
         say("overriding key rate limit:", a.key_rate_limit)
@@ -93,6 +95,10 @@ function config(a)
     if a.bw_rate_limit then
         say("overriding bandwidth rate limit:", a.bw_rate_limit)
         o.bw_rate_limit = a.bw_rate_limit
+    end
+    if a.dst_conns then
+        say("overriding destination connection limit:", a.dst_conns)
+        o.dst_conns = a.dst_conns
     end
     say("completed argument parsing")
 
@@ -169,12 +175,16 @@ function dumpload_run(a)
         return
     end
     say("source socket connected")
-    local dst_c = mcs.client_new(a.dst_host)
-    if not mcs.client_connect(dst_c) then
-        print("ERROR: Failed to connect to destination")
-        return
+    local dst_conns = {}
+    for x=1,a.dst_conns do
+        local dst_c = mcs.client_new(a.dst_host)
+        if not mcs.client_connect(dst_c) then
+            print("ERROR: Failed to connect to destination")
+            return
+        end
+        dst_conns[x] = dst_c
     end
-    say("destination socket connected")
+    say("destination sockets connected:", #dst_conns)
 
     for x=1,a.startwait do
         mcs.client_write(key_c, "lru_crawler mgdump hash\r\n")
@@ -220,7 +230,7 @@ function dumpload_run(a)
         --print("key batch read")
         request_src_keys(src_c, keys_in)
         --print("received keys from source")
-        send_keys_to_dst(src_c, dst_c, window_start, bw_rate_limit)
+        send_keys_to_dst(src_c, dst_conns, window_start, bw_rate_limit)
         --print("sent keys to dest")
 
         if bw_rate_limit ~= 0 or key_rate_limit ~= 0 then
@@ -246,12 +256,17 @@ function relax(window_start)
 end
 
 -- TODO: limit bytes in buffer by periodically flushing to dest.
-function send_keys_to_dst(src_c, dst_c, window_start, bw_limit)
+--
+function send_keys_to_dst(src_c, dst_conns, window_start, bw_limit)
     -- "res" objects are only valid until the next time mcs.client_read(c) is
     -- called, so we cannot stack them. This is done to avoid extra large
     -- allocations and data copies.
     local sent_bytes = 0
+    local idx = 1
+
     while true do
+        local dst_c = dst_conns[idx % #dst_conns + 1]
+        idx = idx + 1
         local res, err = mcs.client_read(src_c)
         if res == nil then
             error("ERROR: reading from data source failed: " .. err)
@@ -262,7 +277,6 @@ function send_keys_to_dst(src_c, dst_c, window_start, bw_limit)
         -- string line.
         if rline == "MN" then
             --print("completed dest batch write")
-            mcs.client_write(dst_c, "mn\r\n")
             break
         else
             s_keys_sent = s_keys_sent + 1
@@ -272,7 +286,9 @@ function send_keys_to_dst(src_c, dst_c, window_start, bw_limit)
             s_bytes_sent = s_bytes_sent + bytes
         end
         if bw_limit ~= 0 and sent_bytes > bw_limit then
-            mcs.client_flush(dst_c)
+            for x=1,#dst_conns do
+                mcs.client_flush(dst_conns[x])
+            end
             relax(window_start)
             window_start = mcs.time_millis()
             sent_bytes = 0
@@ -280,33 +296,41 @@ function send_keys_to_dst(src_c, dst_c, window_start, bw_limit)
     end
 
     -- write outstanding bytes to the network socket.
-    local success, err = mcs.client_flush(dst_c)
-    if not success then
-        error("ERROR: flushing requests to dest failed: " .. err)
-    end
-    -- confirm batch was sent.
-    while true do
-        local res, err = mcs.client_read(dst_c)
-        if res == nil then
-            error("ERROR: reading response from dest failed: " .. err)
+    for x=1,#dst_conns do
+        local dst_c = dst_conns[x]
+        mcs.client_write(dst_c, "mn\r\n")
+        local success, err = mcs.client_flush(dst_c)
+        if not success then
+            error("ERROR: flushing requests to dest failed: " .. err)
         end
-        local rline = mcs.resline(res)
-        if rline == "MN" then
-            break
-        elseif rline == "NS" then
-            s_notstored = s_notstored + 1
-        else
-            -- Some sort of error.
-            local t = mcs.res_split(res)
-            -- FIXME: need internal fixes before the non-SE sections below can
-            -- work. The destination read will fail earlier than this code.
-            if t[1] == "SERVER_ERROR" then
-                s_server_error = s_server_error + 1
-                print(rline)
-            elseif t[1] == "CLIENT_ERROR" or t[1] == "CLIENT_ERROR" or t[1] == "ERROR" then
-                error("ERROR: must stop, protocol error: " .. rline)
+    end
+
+    -- confirm batch was sent.
+    for x=1,#dst_conns do
+        local dst_c = dst_conns[x]
+        while true do
+            local res, err = mcs.client_read(dst_c)
+            if res == nil then
+                error("ERROR: reading response from dest failed: " .. err)
+            end
+            local rline = mcs.resline(res)
+            if rline == "MN" then
+                break
+            elseif rline == "NS" then
+                s_notstored = s_notstored + 1
             else
-                error("ERROR: garbage received from dest: " .. rline)
+                -- Some sort of error.
+                local t = mcs.res_split(res)
+                -- FIXME: need internal fixes before the non-SE sections below can
+                -- work. The destination read will fail earlier than this code.
+                if t[1] == "SERVER_ERROR" then
+                    s_server_error = s_server_error + 1
+                    print(rline)
+                elseif t[1] == "CLIENT_ERROR" or t[1] == "CLIENT_ERROR" or t[1] == "ERROR" then
+                    error("ERROR: must stop, protocol error: " .. rline)
+                else
+                    error("ERROR: garbage received from dest: " .. rline)
+                end
             end
         end
     end
