@@ -94,7 +94,7 @@ function config(a)
     end
     if a.startwait then
         say("overriding start wait time:", a.startwait)
-        o.startwait = a.startwait
+        o.startwait = tonumber(a.startwait)
     end
     if a.batch_size then
         say("overriding key batch size:", a.batch_size)
@@ -102,11 +102,11 @@ function config(a)
     end
     if a.key_rate_limit then
         say("overriding key rate limit:", a.key_rate_limit)
-        o.key_rate_limit = a.key_rate_limit
+        o.key_rate_limit = tonumber(a.key_rate_limit)
     end
     if a.bw_rate_limit then
         say("overriding bandwidth rate limit:", a.bw_rate_limit)
-        o.bw_rate_limit = a.bw_rate_limit
+        o.bw_rate_limit = tonumber(a.bw_rate_limit)
     end
     if a.dst_conns then
         say("overriding destination connection limit:", a.dst_conns)
@@ -114,6 +114,21 @@ function config(a)
     end
     say("completed argument parsing")
 
+    -- setup the rate limiters if specified.
+    if o.key_rate_limit ~= 0 then
+        -- limit every 10th of a second for smoothing.
+        o.key_batch_size = o.key_rate_limit / 10
+    end
+
+    if o.bw_rate_limit ~= 0 then
+        local bits_sec = o.bw_rate_limit * 1000
+        -- since we write bytes.
+        local bytes_sec = bits_sec / 8
+        -- reduce to the timeslice limit.
+        o.bw_rate_limit = bytes_sec / 10
+    end
+
+    -- initialize thread and coroutines.
     local t = mcs.thread()
     mcs.add_custom(t, { func = "dumpload" }, o)
     for x=1,o.dst_conns do
@@ -150,6 +165,7 @@ function stats()
         print("bytes_sent:", s_bytes_sent - last_bytes_sent)
         print("notstored:", s_notstored - last_notstored)
         print("server_error:", s_server_error - last_server_error)
+        print("===END STATS===")
         last_keys_listed = s_keys_listed
         last_keys_sent = s_keys_sent
         last_bytes_sent = s_bytes_sent
@@ -163,32 +179,33 @@ function stats()
     print("bytes_sent:", s_bytes_sent)
     print("notstored:", s_notstored)
     print("sever_error:", s_server_error)
+    print("===END STATS===")
 end
 
 function dumpload(a)
+    verbose = a.verbose
     dumpload_run(a)
+
+    print("===DUMP=== complete")
     dump_complete = true
 end
 
-function dumpload_run(a)
-    local keys_in = {}
-    verbose = a.verbose
-
-    say("key host:", a.key_host["host"])
-    say("key port:", a.key_host["port"])
-    --mcs.sleep_millis(5000)
+-- creates and initializes the client objects.
+-- side effect: modifies g_dst_conns
+function dumpload_makeconns(a)
     local key_c = mcs.client_new(a.key_host)
-    -- TODO: error handling.
     if not mcs.client_connect(key_c) then
         print("ERROR: Failed to connect to key dump source")
         return
     end
+
     say("keylist socket connected")
     local src_c = mcs.client_new(a.src_host)
     if not mcs.client_connect(src_c) then
         print("ERROR: Failed to connet to data source")
         return
     end
+
     say("source socket connected")
     local dst_conns = {}
     for x=1,a.dst_conns do
@@ -202,7 +219,13 @@ function dumpload_run(a)
     end
     say("destination sockets connected:", #dst_conns)
 
-    for x=1,a.startwait do
+    return key_c, src_c, dst_conns
+end
+
+function dumpload_start(key_c, trials)
+    local keys_in = {}
+
+    for x=1,trials do
         mcs.client_write(key_c, "lru_crawler mgdump hash\r\n")
         mcs.client_flush(key_c)
         -- read a raw line to avoid protocol parsing
@@ -218,25 +241,23 @@ function dumpload_run(a)
         end
     end
 
+    if #keys_in == 0 then
+        error("ERROR: timed out waiting for lru_crawler to become available")
+    end
+
+    return keys_in
+end
+
+function dumpload_run(a)
+    local key_c, src_c, dst_conns = dumpload_makeconns(a)
+    local keys_in = dumpload_start(key_c, a.startwait)
+
     say("dump started")
     dump_started = true
 
     local key_batch_size = a.key_batch_size
-    local bw_rate_limit = 0
-    local key_rate_limit = 0
-    if a.key_rate_limit ~= 0 then
-        -- limit every 10th of a second for smoothing.
-        key_batch_size = a.key_rate_limit / 10
-        key_rate_limit = a.key_rate_limit
-    end
-
-    if a.bw_rate_limit ~= 0 then
-        local bits_sec = a.bw_rate_limit * 1000
-        -- since we write bytes.
-        local bytes_sec = bits_sec / 8
-        -- reduce to the timeslice limit.
-        bw_rate_limit = bytes_sec / 10
-    end
+    local bw_rate_limit = a.bw_rate_limit
+    local key_rate_limit = a.key_rate_limit
 
     while true do
         local window_start = mcs.time_millis()
@@ -256,7 +277,6 @@ function dumpload_run(a)
         -- clear the keys queue so we'll fetch another batch.
         keys_in = {}
         if key_complete then
-            print("===DUMP=== complete")
             break
         end
     end
@@ -319,11 +339,9 @@ function send_keys_to_dst(src_c, dst_conns, window_start, bw_limit)
             error("ERROR: reading from data source failed: " .. err)
         end
         local rline = mcs.resline(res)
-        --print("result line from source:", rline)
         -- TODO: c func for asking if this res is an MN instead of copying the
         -- string line.
         if rline == "MN" then
-            --print("completed dest batch write")
             break
         else
             s_keys_sent = s_keys_sent + 1
