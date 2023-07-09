@@ -891,7 +891,7 @@ static int mcs_cfunc_run(void *udata) {
             break;
         case mcs_fstate_syserr:
             c = lua_touserdata(f->L, 1);
-            mcmc_disconnect(c);
+            mcmc_disconnect(c->mcmc);
             c->connected = false;
             // FIXME: need better way to communicate client has errored.
             lua_pushnil(f->L);
@@ -1849,6 +1849,12 @@ static int mcslib_client_flush(lua_State *L) {
     return lua_yield(L, 2);
 }
 
+static int mcslib_client_connected(lua_State *L) {
+    struct mcs_func_client *c = lua_touserdata(L, 1);
+    lua_pushboolean(L, c->connected);
+    return 1;
+}
+
 // TODO: minimal argument validation?
 // since this is a benchmark tool we should attempt to minmax, and argument
 // checking does take measurable time.
@@ -1882,6 +1888,12 @@ static int mcslib_client_write_mgres_to_ms(lua_State *L) {
         _tokenize(r);
     }
 
+    // Only convert VA responses.
+    if (r->resp.reslen < 2 || strncmp(r->buf, "VA", 2) != 0) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
     // make sure we have headroom in the dest wbuf
     mcs_expand_wbuf(c, r->resp.reslen + r->resp.vlen);
 
@@ -1909,6 +1921,9 @@ static int mcslib_client_write_mgres_to_ms(lua_State *L) {
     p++;
 
     // write value length
+    if (r->resp.vlen < 2) {
+        fprintf(stderr, "HALT\n");
+    }
     p = itoa_u32(r->resp.vlen-2, p);
 
     *p = ' ';
@@ -1938,7 +1953,17 @@ static int mcslib_client_write_mgres_to_ms(lua_State *L) {
                    p++;
                 } else {
                     memcpy(p, token+1, tlen-1);
+                    p += tlen-1;
                 }
+                *p = ' ';
+                p++;
+                break;
+            case 'O':
+                *p = 'O';
+                p++;
+                memcpy(p, token+1, tlen-1);
+                p += tlen-1;
+
                 *p = ' ';
                 p++;
                 break;
@@ -1957,7 +1982,8 @@ static int mcslib_client_write_mgres_to_ms(lua_State *L) {
     // note buffer usage.
     c->wbuf_used += p - (c->wbuf + c->wbuf_used);
 
-    return 0;
+    lua_pushboolean(L, 1);
+    return 1;
 }
 
 static int mcslib_resline(lua_State *L) {
@@ -2433,6 +2459,7 @@ static void register_lua_libs(lua_State *L) {
         {"client_write", mcslib_client_write},
         {"client_flush", mcslib_client_flush},
         {"client_readline", mcslib_client_readline},
+        {"client_connected", mcslib_client_connected},
         {"client_write_mgres_to_ms", mcslib_client_write_mgres_to_ms},
         // func functions.
         {"write", mcslib_write},
