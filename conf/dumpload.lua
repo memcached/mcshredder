@@ -1,6 +1,58 @@
+-- THEORY OF OPERATION
+-- Main loop:
+-- - read key batch from key lister (ie: 1000 keys)
+-- - write key request batch to source host. cap with "mn\r\n"
+-- - select free dest host connection
+-- - move responses from source host to dest host write buffer
+-- - stop when "MN\r\n" received from source host
+-- - send dest connection to coroutine
+--   - coroutine adds "mn\r\n" cap to write buffer
+--   - flush requests
+--   - read responses.
+--     - counts NS.
+--     - errors if CLIENT_ERROR|ERROR
+--     - if SERVER_ERROR or dest disconnected, mark batch for retry
+--   - if dst is disconnected, wait for reconnect in loop
+--   - else mark batch completed
+-- - in main loop, if dest connection is found waiting for retry, re-submit
+--   its key batch to the source host as above and re-dispatch.
+-- - when key dumping is complete and no dest conns are busy, exit.
+--
+-- TECHNICAL DETAILS
+-- * The main coroutine reads keys from the key list and writes/reads data
+-- from the source connection
+-- * A coroutine exists for each destination connection. These coroutines
+-- handle flushing their own write buffers to the network, and reading
+-- responses back from the destination host to confirm a batch was sent.
+-- * Internally this allows some syscall parallelism due to io_uring.
+-- * Multiple coroutines can make progress concurrently, allowing us to make
+-- good use of the CPU.
+--
+-- RETRY THEORY
+-- * If key lister or source host disconnect, halt.
+-- * If anything goes wrong with the destination, the entire key batch is retried.
+-- * If the destination socket disconnected, we cannot confirm if any keys
+-- were successfully written.
+-- * If any individual key fails with SERVER_ERROR, it is likely a lot more
+-- will fail.
+-- * There is no benefit to only retrying keys which met with
+-- SERVER_ERROR, as we _must_ be tolerant to retrying the entire batch in cases
+-- where the destination host reconnects.
+-- * The code is much shorter and simpler if we retry the whole batch.
+-- * Confirming individual keys halves the performance
+-- * The batches are not very large; and even smaller if key rate limits are
+-- employed, minimizing the amount of rewriting.
+
 -- TODO: top level issues:
--- destination buffer size limiter.
--- data retry...
+-- * destination buffer size limiter.
+-- * CLIENT_ERROR / etc aren't killing the process properly under retry mode, as
+--   those errors are handled by mcshredder. needs mcshredder fix.
+-- * key prefix filtering
+-- * jump hash node filtering
+-- * some more response filtering from the source host is probably helpful for
+-- paranoia.
+-- * I lost 20% performance converting the main loop for retries. See if this
+-- can be regained.
 
 local DEFAULT_HOST = "127.0.0.1"
 local DEFAULT_PORT = "11211"
@@ -12,7 +64,8 @@ local o = {
     startwait = 10,
     key_batch_size = 1000,
     key_rate_limit = 0,
-    bw_rate_limit = 0 -- kilobits
+    bw_rate_limit = 0, -- kilobits
+    retry = false,
 }
 
 local verbose = false
@@ -24,6 +77,7 @@ s_keys_sent = 0
 s_bytes_sent = 0
 s_notstored = 0
 s_server_error = 0
+s_retries = 0
 
 -- INTERNAL GLOBALS
 -- to parallelize writing data to and verifying responses with destination
@@ -36,6 +90,8 @@ s_server_error = 0
 -- multi-dest sockets.
 g_dst_conns = {}
 g_dst_flushing = {}
+g_dst_batch = {}
+g_dst_retry = {}
 
 function say(...)
     if verbose then
@@ -48,6 +104,7 @@ function help()
 
 verbose (false) (print extra state information)
 stats (false) (print some stats output every second)
+retry (false) (add extra validation and retry steps for unreliable situations)
 key_host (127.0.0.1) (host to fetch key list from)
 key_port (11211) (port for above)
 src_host (127.0.0.1) (host to fetch key data from)
@@ -67,6 +124,9 @@ function config(a)
     if a.verbose then
         verbose = true
         o.verbose = true
+    end
+    if a.retry then
+        o.retry = true
     end
     if a.key_host then
         say("overriding key host name:", a.key_host)
@@ -105,8 +165,9 @@ function config(a)
         o.key_rate_limit = tonumber(a.key_rate_limit)
     end
     if a.bw_rate_limit then
-        say("overriding bandwidth rate limit:", a.bw_rate_limit)
-        o.bw_rate_limit = tonumber(a.bw_rate_limit)
+        --say("overriding bandwidth rate limit:", a.bw_rate_limit)
+        --o.bw_rate_limit = tonumber(a.bw_rate_limit)
+        print("WARNING: bandwidth limiter disabled pending code fix")
     end
     if a.dst_conns then
         say("overriding destination connection limit:", a.dst_conns)
@@ -132,7 +193,7 @@ function config(a)
     local t = mcs.thread()
     mcs.add_custom(t, { func = "dumpload" }, o)
     for x=1,o.dst_conns do
-        mcs.add_custom(t, { func = "destwriter" }, { idx = x })
+        mcs.add_custom(t, { func = "destwriter" }, { idx = x, retry = o.retry })
     end
     if a.stats then
         mcs.add_custom(t, { func = "stats" })
@@ -150,6 +211,7 @@ function stats()
     local last_bytes_sent = 0
     local last_notstored = 0
     local last_server_error = 0
+    local last_retries = 0
     while dump_started == false do
         mcs.sleep_millis(100)
         -- so we don't print random junk if the dump doesn't even start.
@@ -165,12 +227,14 @@ function stats()
         print("bytes_sent:", s_bytes_sent - last_bytes_sent)
         print("notstored:", s_notstored - last_notstored)
         print("server_error:", s_server_error - last_server_error)
+        print("batch retries:", s_retries - last_retries)
         print("===END STATS===")
         last_keys_listed = s_keys_listed
         last_keys_sent = s_keys_sent
         last_bytes_sent = s_bytes_sent
         last_notstored = s_notstored
         last_server_error = s_server_error
+        last_retries = s_retries
     end
 
     print("===FINAL STATS===")
@@ -179,6 +243,7 @@ function stats()
     print("bytes_sent:", s_bytes_sent)
     print("notstored:", s_notstored)
     print("sever_error:", s_server_error)
+    print("batch retries:", s_retries)
     print("===END STATS===")
 end
 
@@ -258,42 +323,56 @@ function dumpload_run(a)
     local key_batch_size = a.key_batch_size
     local bw_rate_limit = a.bw_rate_limit
     local key_rate_limit = a.key_rate_limit
+    local window_start = mcs.time_millis()
 
     while true do
-        local window_start = mcs.time_millis()
 
-        --print("reading key batch")
-        read_keys(key_c, keys_in, key_batch_size)
-        --print("key batch read")
-        request_src_keys(src_c, keys_in)
-        --print("received keys from source")
-        send_keys_to_dst(src_c, dst_conns, window_start, bw_rate_limit)
-        --print("sent keys to dest")
+        local busy_dst = 0
+        for x=1,#dst_conns do
+            local dst_c = dst_conns[x]
+            -- check if destination is ready for a new batch.
+            if g_dst_flushing[x] then
+                busy_dst = busy_dst + 1
+            else
+                -- reuse the prior key batch if we need to issue a retry.
+                if g_dst_retry[x] then
+                    g_dst_retry[x] = false
+                else
+                    read_keys(key_c, keys_in, key_batch_size)
+                    g_dst_batch[x] = keys_in
+                    keys_in = {}
+                end
 
-        if bw_rate_limit ~= 0 or key_rate_limit ~= 0 then
-            relax(window_start)
+                -- if the key dump is complete, we might not fetch keys. lua
+                -- has no 'continue' so we test the batch length.
+                if #g_dst_batch[x] ~= 0 then
+                    request_src_keys(src_c, g_dst_batch[x], a.retry)
+                    send_keys_to_dst(src_c, dst_c, window_start, bw_rate_limit)
+
+                    -- mark destination connection as ready to flush.
+                    -- coroutine will pick it up
+                    g_dst_flushing[x] = true
+                    busy_dst = busy_dst + 1
+
+                    -- rate limiter is checked for each key batch.
+                    if bw_rate_limit ~= 0 or key_rate_limit ~= 0 then
+                        relax(window_start)
+                        window_start = mcs.time_millis()
+                    end
+                else
+                    print("BATCH EMPTY")
+                end
+            end
         end
 
-        -- clear the keys queue so we'll fetch another batch.
-        keys_in = {}
-        if key_complete then
+        -- let other coroutines run.
+        if busy_dst ~= 0 then
+            mcs.sleep_millis(1)
+        end
+
+        if key_complete and busy_dst == 0 then
             break
         end
-    end
-
-    -- wait for any flushing destinations to complete.
-    while true do
-        local done = true
-        for x=1,#dst_conns do
-           if g_dst_flushing[x] then
-               done = false
-           end
-       end
-       if done then
-           break
-       else
-           mcs.sleep_millis(1)
-       end
     end
 end
 
@@ -308,76 +387,77 @@ end
 
 -- TODO: limit bytes in buffer by periodically flushing to dest.
 --
-function send_keys_to_dst(src_c, dst_conns, window_start, bw_limit)
+function send_keys_to_dst(src_c, dst_c, window_start, bw_limit)
     -- "res" objects are only valid until the next time mcs.client_read(c) is
     -- called, so we cannot stack them. This is done to avoid extra large
     -- allocations and data copies.
     local sent_bytes = 0
-    local idx = 0
-    local dst_c = nil
-    while true do
-        for x=1,#dst_conns do
-            -- find first available destination connection
-            if not g_dst_flushing[x] then
-                dst_c = dst_conns[x]
-                idx = x
-                break
-            end
-        end
-
-        if dst_c ~= nil then
-            break
-        else
-            -- didn't find a free destination socket.
-            mcs.sleep_millis(1)
-        end
-    end
 
     while true do
         local res, err = mcs.client_read(src_c)
         if res == nil then
-            error("ERROR: reading from data source failed: " .. err)
+            error("ERROR: reading response from source failed: " .. err)
         end
+        -- TODO: tick counter and skip write if EN
         local rline = mcs.resline(res)
         -- TODO: c func for asking if this res is an MN instead of copying the
         -- string line.
         if rline == "MN" then
             break
         else
-            s_keys_sent = s_keys_sent + 1
-            mcs.client_write_mgres_to_ms(res, dst_c)
-            local bytes = mcs.res_len(res)
-            sent_bytes = sent_bytes + bytes
-            s_bytes_sent = s_bytes_sent + bytes
+            local done = mcs.client_write_mgres_to_ms(res, dst_c)
+
+            if done then
+                s_keys_sent = s_keys_sent + 1
+                local bytes = mcs.res_len(res)
+                sent_bytes = sent_bytes + bytes
+                s_bytes_sent = s_bytes_sent + bytes
+            end
         end
-        if bw_limit ~= 0 and sent_bytes > bw_limit then
-            mcs.client_flush(dst_c)
-            relax(window_start)
-            window_start = mcs.time_millis()
-            sent_bytes = 0
-        end
+
+        -- FIXME: this doesn't align with retry mode.
+        -- might have to just let bw be spikey and relax at a higher level?
+        -- or remove the bw limiter mode and just use key rate?
+        --if bw_limit ~= 0 and sent_bytes > bw_limit then
+        --    mcs.client_flush(dst_c)
+        --    relax(window_start)
+        --    window_start = mcs.time_millis()
+        --    sent_bytes = 0
+        --end
     end
-
-    -- mark destination connection as ready to flush.
-    -- coroutine will pick it up
-    g_dst_flushing[idx] = true
-
-    --print("flushed destination client")
 end
 
 -- separate coroutine function for flushing to destination sockets.
+-- NOTE: can't use pcall() and handle errors for the retry loop here, as
+-- protected calls across yielded C functions requires special handling.
 function destwriter(o)
     local idx = o.idx
     while not dump_started do
         mcs.sleep_millis(10)
     end
+    local dst_c = g_dst_conns[idx]
 
     while true do
         if not g_dst_flushing[idx] then
             mcs.sleep_millis(1)
         else
-            dest_flush(g_dst_conns[idx])
+            local done = dest_flush(dst_c)
+            if not done then
+                if o.retry then
+                    g_dst_retry[idx] = true
+                    s_retries = s_retries + 1
+                    while not mcs.client_connected(dst_c) do
+                        mcs.sleep_millis(500)
+                        mcs.client_connect(dst_c)
+                    end
+                elseif not mcs.client_connected(dst_c) then
+                    -- only error if we didn't want to retry but the whole
+                    -- socket is lost.
+                    error("connection lost while reading from dest")
+                end
+            end
             g_dst_flushing[idx] = false
+
         end
 
         if dump_complete then
@@ -388,17 +468,20 @@ end
 
 -- actually handles flushing
 function dest_flush(dst_c)
+    local done = true
     -- cap the write and flush
     mcs.client_write(dst_c, "mn\r\n")
     local success, err = mcs.client_flush(dst_c)
     if not success then
-        error("ERROR: flushing requests to dest failed: " .. err)
+        print("ERROR: flushing requests to dest failed: " .. err)
+        return false
     end
 
     while true do
         local res, err = mcs.client_read(dst_c)
         if res == nil then
-            error("ERROR: reading response from dest failed: " .. err)
+            print("ERROR: reading response from dest failed: " .. err)
+            return false
         end
         local rline = mcs.resline(res)
         if rline == "MN" then
@@ -412,6 +495,7 @@ function dest_flush(dst_c)
             -- work. The destination read will fail earlier than this code.
             if t[1] == "SERVER_ERROR" then
                 s_server_error = s_server_error + 1
+                done = false
                 print(rline)
             elseif t[1] == "CLIENT_ERROR" or t[1] == "CLIENT_ERROR" or t[1] == "ERROR" then
                 error("ERROR: must stop, protocol error: " .. rline)
@@ -420,6 +504,8 @@ function dest_flush(dst_c)
             end
         end
     end
+
+    return done
 end
 
 function request_src_keys(src_c, keys_in)
