@@ -2165,10 +2165,10 @@ static int mcslib_get(lua_State *L) {
     memcpy(p, pfx, len);
     p += len;
 
-    int num = lua_tointeger(L, 2);
+    long num = lua_tointeger(L, 2);
 
     if (num > -1) {
-        p = itoa_32(num, p);
+        p = itoa_64(num, p);
     }
     klen = p - key;
     req->hash = XXH3_64bits(key, klen);
@@ -2199,10 +2199,10 @@ static int mcslib_delete(lua_State *L) {
     memcpy(p, pfx, len);
     p += len;
 
-    int num = lua_tointeger(L, 2);
+    long num = lua_tointeger(L, 2);
 
     if (num > -1) {
-        p = itoa_32(num, p);
+        p = itoa_64(num, p);
     }
     klen = p - key;
     req->hash = XXH3_64bits(key, klen);
@@ -2233,10 +2233,10 @@ static int mcslib_touch(lua_State *L) {
     memcpy(p, pfx, len);
     p += len;
 
-    int num = lua_tointeger(L, 2);
+    long num = lua_tointeger(L, 2);
 
     if (num > -1) {
-        p = itoa_32(num, p);
+        p = itoa_64(num, p);
     }
     klen = p - key;
     req->hash = XXH3_64bits(key, klen);
@@ -2273,10 +2273,10 @@ static int mcslib_set(lua_State *L) {
     memcpy(p, pfx, len);
     p += len;
 
-    int num = lua_tointeger(L, 2);
+    long num = lua_tointeger(L, 2);
 
     if (num > -1) {
-        p = itoa_32(num, p);
+        p = itoa_64(num, p);
     }
     klen = p - key;
     req->hash = XXH3_64bits(key, klen);
@@ -2325,10 +2325,10 @@ static int mcslib_ms(lua_State *L) {
     memcpy(p, pfx, len);
     p += len;
 
-    int num = lua_tointeger(L, 2);
+    long num = lua_tointeger(L, 2);
 
     if (num > -1) {
-        p = itoa_32(num, p);
+        p = itoa_64(num, p);
     }
     klen = p - key;
     req->hash = XXH3_64bits(key, klen);
@@ -2381,10 +2381,10 @@ static int _mcslib_basic(lua_State *L, char cmd) {
     memcpy(p, pfx, len);
     p += len;
 
-    int num = lua_tointeger(L, 2);
+    long num = lua_tointeger(L, 2);
 
     if (num > -1) {
-        p = itoa_32(num, p);
+        p = itoa_64(num, p);
     }
     klen = p - key;
     req->hash = XXH3_64bits(key, klen);
