@@ -131,6 +131,7 @@ enum mcs_func_state {
 
 enum mcs_lua_yield {
     mcs_luayield_write = 0,
+    mcs_luayield_write_factory,
     mcs_luayield_flush,
     mcs_luayield_read,
     mcs_luayield_sleep,
@@ -139,6 +140,7 @@ enum mcs_lua_yield {
     mcs_luayield_c_read,
     mcs_luayield_c_readline,
     mcs_luayield_c_write,
+    mcs_luayield_c_write_factory,
     mcs_luayield_c_flush,
 };
 
@@ -159,6 +161,23 @@ struct mcs_func_req {
     int vlen;
     uint64_t hash; // hash of the key, used to match the value.
     char data[];
+};
+
+// factories can have at most one outstanding request at a time if you want to
+// use response matching.
+// if pipelining requests, pre-make N factories.
+struct mcs_func_req_factory {
+    // these next few are updated on the factory use so we can match a
+    // response object.
+    struct timespec start;
+    uint64_t hash;
+    int64_t numeric; // numeric component of key
+    // everything below here should be static after creation.
+    char cmd;
+    int prefix_len;
+    int postfix_len;
+    char prefix[KEY_MAX_LENGTH+1];
+    char postfix[REQ_MAX_LENGTH+1]; // any flags get bound together here.
 };
 
 // points into func's rbuf
@@ -251,6 +270,42 @@ static void timespec_add(struct __kernel_timespec *ts1,
         ts1->tv_nsec -= NSEC_PER_SEC;
     }
 }
+
+#ifdef MCS_ALLOC_PROFILE
+static void *profile_alloc (void *ud, void *ptr, size_t osize,
+                                            size_t nsize) {
+   (void)ud;  (void)osize;  /* not used */
+   if (ptr == NULL) {
+        switch (osize) {
+            case LUA_TSTRING:
+                fprintf(stderr, "alloc string: %ld\n", nsize);
+                break;
+            case LUA_TTABLE:
+                fprintf(stderr, "alloc table: %ld\n", nsize);
+                break;
+            case LUA_TFUNCTION:
+                fprintf(stderr, "alloc func: %ld\n", nsize);
+                break;
+            case LUA_TUSERDATA:
+                fprintf(stderr, "alloc userdata: %ld\n", nsize);
+                break;
+            case LUA_TTHREAD:
+                fprintf(stderr, "alloc thread: %ld\n", nsize);
+                break;
+            default:
+                fprintf(stderr, "alloc osize: %ld nsize: %ld\n", osize, nsize);
+        }
+   } else {
+       fprintf(stderr, "realloc: osize: %ld nsize: %ld\n", osize, nsize);
+   }
+   if (nsize == 0) {
+     free(ptr);
+     return NULL;
+   } else {
+     return realloc(ptr, nsize);
+   }
+}
+#endif
 
 // Common lua debug command.
 __attribute__((unused)) void dump_stack(lua_State *L) {
@@ -1061,6 +1116,41 @@ static int mcslib_write_c(struct mcs_func *f, struct mcs_func_client *c) {
     return 0;
 }
 
+// uses the passed factory and numeric to write request into the client
+// write buffer.
+static int mcslib_write_c_factory(struct mcs_func *f, struct mcs_func_client *c) {
+    struct mcs_func_req_factory *req = lua_touserdata(f->L, -2);
+
+    mcs_expand_wbuf(c, REQ_MAX_LENGTH);
+
+    char *p = c->wbuf + c->wbuf_used;
+    char *start = p;
+
+    memcpy(p, "m  ", 3);
+    p[1] = req->cmd;
+    p += 3;
+    char *key = p;
+
+    memcpy(p, req->prefix, req->prefix_len);
+    p += req->prefix_len;
+
+    req->numeric = lua_tointeger(f->L, -1);
+    if (req->numeric > -1) {
+        p = itoa_64(req->numeric, p);
+    }
+    int klen = p - key;
+    req->hash = XXH3_64bits(key, klen);
+
+    // should include the \r\n terminator.
+    memcpy(p, req->postfix, req->postfix_len);
+    p += req->postfix_len;
+
+    clock_gettime(CLOCK_MONOTONIC, &req->start);
+    c->wbuf_used += p - start;
+
+    return 0;
+}
+
 // TODO: the read routine can offset via rbuf_toconsume until we hit
 // "MCMC_WANT_READ" to avoid memmove's in most/many cases.
 // Avoiding this optimization for now for stability.
@@ -1099,6 +1189,9 @@ static int mcs_func_lua_yield(struct mcs_func *f, int nresults) {
     switch (yield_type) {
         case mcs_luayield_write:
             res = mcslib_write_c(f, &f->c);
+            break;
+        case mcs_luayield_write_factory:
+            res = mcslib_write_c_factory(f, &f->c);
             break;
         case mcs_luayield_flush:
             f->c.wbuf_sent = 0;
@@ -1151,6 +1244,10 @@ static int mcs_func_lua_yield(struct mcs_func *f, int nresults) {
         case mcs_luayield_c_write:
             c = lua_touserdata(f->L, 1);
             res = mcslib_write_c(f, c);
+            break;
+        case mcs_luayield_c_write_factory:
+            c = lua_touserdata(f->L, 1);
+            res = mcslib_write_c_factory(f, c);
             break;
         case mcs_luayield_c_flush:
             c = lua_touserdata(f->L, 1);
@@ -1334,7 +1431,11 @@ static int mcslib_thread(lua_State *L) {
 
     t->ctx = ctx;
     t->active_funcs = 0;
+#ifdef MCS_ALLOC_PROFILE
+    t->L = lua_newstate(profile_alloc, NULL);
+#else
     t->L = luaL_newstate();
+#endif
     // allow in-thread functions to access both the parent thread and ctx
     struct mcs_thread **extra = lua_getextraspace(t->L);
     *extra = t;
@@ -1952,6 +2053,12 @@ static int mcslib_client_write(lua_State *L) {
     return lua_yield(L, 2);
 }
 
+static int mcslib_client_write_factory(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TUSERDATA);
+    lua_pushinteger(L, mcs_luayield_c_write_factory);
+    return lua_yield(L, 2);
+}
+
 static int mcslib_client_flush(lua_State *L) {
     luaL_checktype(L, 1, LUA_TUSERDATA);
     lua_pushinteger(L, mcs_luayield_c_flush);
@@ -1969,6 +2076,11 @@ static int mcslib_client_connected(lua_State *L) {
 // checking does take measurable time.
 static int mcslib_write(lua_State *L) {
     lua_pushinteger(L, mcs_luayield_write);
+    return lua_yield(L, 2);
+}
+
+static int mcslib_write_factory(lua_State *L) {
+    lua_pushinteger(L, mcs_luayield_write_factory);
     return lua_yield(L, 2);
 }
 
@@ -2663,6 +2775,51 @@ static int mcslib_ma(lua_State *L) {
     return _mcslib_basic(L, 'a');
 }
 
+static int _mcslib_basic_factory(lua_State *L, char cmd) {
+    struct mcs_func_req_factory *req = lua_newuserdatauv(L, sizeof(struct mcs_func_req_factory), 0);
+    int argc = lua_gettop(L);
+
+    size_t len = 0;
+    const char *pfx = lua_tolstring(L, 1, &len);
+
+    req->cmd = cmd;
+
+    // TODO: we can afford to do more thorough argument checking here.
+    memcpy(req->prefix, pfx, len);
+    req->prefix_len = len;
+
+    char *p = req->postfix;
+    char *start = p;
+    for (int x = 2; x < argc; x++) {
+        const char *flags = lua_tolstring(L, x, &len);
+        if (len) {
+            *p = ' ';
+            p++;
+            memcpy(p, flags, len);
+            p += len;
+        }
+    }
+
+    memcpy(p, "\r\n", 2);
+    p += 2;
+
+    req->postfix_len = p - start;
+
+    return 1;
+}
+
+static int mcslib_mg_factory(lua_State *L) {
+    return _mcslib_basic_factory(L, 'g');
+}
+
+static int mcslib_md_factory(lua_State *L) {
+    return _mcslib_basic_factory(L, 'd');
+}
+
+static int mcslib_ma_factory(lua_State *L) {
+    return _mcslib_basic_factory(L, 'a');
+}
+
 static int mcslib_time_millis(lua_State *L) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -2709,6 +2866,7 @@ static void register_lua_libs(lua_State *L) {
         {"client_connect", mcslib_client_connect},
         {"client_read", mcslib_client_read},
         {"client_write", mcslib_client_write},
+        {"client_write_factory", mcslib_client_write_factory},
         {"client_flush", mcslib_client_flush},
         {"client_readline", mcslib_client_readline},
         {"client_connected", mcslib_client_connected},
@@ -2720,6 +2878,7 @@ static void register_lua_libs(lua_State *L) {
         {"out_wait", mcslib_out_wait},
         {"out_readline", mcslib_out_readline},
         {"write", mcslib_write},
+        {"write_factory", mcslib_write_factory},
         {"flush", mcslib_flush},
         {"read", mcslib_read},
         {"stop", mcslib_stop},
@@ -2743,6 +2902,9 @@ static void register_lua_libs(lua_State *L) {
         {"ms", mcslib_ms},
         {"md", mcslib_md},
         {"ma", mcslib_ma},
+        {"mg_factory", mcslib_mg_factory},
+        {"md_factory", mcslib_md_factory},
+        {"ma_factory", mcslib_ma_factory},
         {NULL, NULL}
     };
 
