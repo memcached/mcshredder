@@ -191,6 +191,7 @@ struct mcs_func {
     int self_ref; // avoid garbage collection
     int self_ref_coro; // reference for the coroutine thread
     int arg_ref; // reference for function argument
+    int func_ref; // reference to the function to call
     STAILQ_ENTRY(mcs_func) next_run; // coroutine run stack.
     STAILQ_ENTRY(mcs_func) next_func; // total live list.
     struct mcs_thread *parent; // pointer back to owner thread
@@ -1169,11 +1170,7 @@ static int mcs_func_lua(struct mcs_func *f) {
     switch (status) {
         case LUA_OK:
             // Kick off the function from the top.
-            lua_getglobal(f->L, f->fname);
-            if (lua_isnil(f->L, -1)) {
-                fprintf(stderr, "Configuration missing '%s' function\n", f->fname);
-                exit(EXIT_FAILURE);
-            }
+            lua_rawgeti(f->L, LUA_REGISTRYINDEX, f->func_ref);
             f->lua_nargs = 0;
             if (f->arg_ref) {
                 lua_rawgeti(f->L, LUA_REGISTRYINDEX, f->arg_ref);
@@ -1563,6 +1560,12 @@ static int mcslib_add(lua_State *L) {
                 f->arg_ref = luaL_ref(t->L, LUA_REGISTRYINDEX);
             }
 
+            lua_getglobal(t->L, fname);
+            if (lua_isnil(t->L, -1)) {
+                luaL_error(L, "mcs.add configuration missing '%s' function", fname);
+            }
+            f->func_ref = luaL_ref(t->L, LUA_REGISTRYINDEX);
+
             // pull data from table into *f
             f->fname = strdup(fname);
 
@@ -1643,6 +1646,12 @@ static int mcslib_add_custom(lua_State *L) {
 
     struct mcs_func *f = mcs_add_custom_func(t);
 
+    lua_getglobal(t->L, fname);
+    if (lua_isnil(t->L, -1)) {
+        luaL_error(L, "mcs.add_custom configuration missing '%s' function", fname);
+    }
+    f->func_ref = luaL_ref(t->L, LUA_REGISTRYINDEX);
+
     f->fname = strdup(fname);
     memcpy(&f->c.conn, &ctx->conn, sizeof(f->c.conn));
 
@@ -1670,6 +1679,7 @@ static void _mcs_cleanup_thread(struct mcs_thread *t) {
         lua_resetthread(f->L);
         luaL_unref(t->L, LUA_REGISTRYINDEX, f->self_ref);
         luaL_unref(t->L, LUA_REGISTRYINDEX, f->self_ref_coro);
+        luaL_unref(t->L, LUA_REGISTRYINDEX, f->func_ref);
         // do not free the function: it's owned by the lua state
     }
     STAILQ_INIT(&t->func_list);
