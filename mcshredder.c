@@ -233,6 +233,7 @@ struct mcs_ctx {
     eventfd_t out_fd;
     uint64_t out_readvar; // let io_uring put eventfd res somewhere.
     bool out_listener; // short circuit if there's no listener.
+    bool stop; // some thread told us to cut out of the shredder.
     int active_threads; // return from shredder() if threads stopped
     int arg_ref; // commandline argument table
     const char *conffile;
@@ -1730,20 +1731,28 @@ static int mcslib_shredder(lua_State *L) {
         return luaL_error(L, "second argument to mcs.shredder must be numeric");
     }
 
+    bool stop_sent = false;
     while (ctx->active_threads) {
         if (use_wait) {
             int res = pthread_cond_timedwait(&ctx->wait_cond, &ctx->wait_lock, &wait);
-            if (res == ETIMEDOUT) {
+            if (res == ETIMEDOUT || ctx->stop) {
                 // loosely signal threads to stop
                 // note lack of locking making this imperfect
                 STAILQ_FOREACH(t, &ctx->threads, next) {
                     t->stop = true;
                 }
                 use_wait = false;
+                stop_sent = true;
                 continue; // retry the loop.
             }
         } else {
             pthread_cond_wait(&ctx->wait_cond, &ctx->wait_lock);
+            if (ctx->stop && !stop_sent) {
+                STAILQ_FOREACH(t, &ctx->threads, next) {
+                    t->stop = true;
+                }
+                stop_sent = true;
+            }
         }
         if (ctx->active_threads == 0) {
             pthread_mutex_unlock(&ctx->wait_lock);
@@ -2628,6 +2637,17 @@ static int mcslib_time_millis(lua_State *L) {
     return 1;
 }
 
+static int mcslib_stop(lua_State *L) {
+    struct mcs_thread *t = *(struct mcs_thread **)lua_getextraspace(L);
+
+    pthread_mutex_lock(&t->ctx->wait_lock);
+    t->ctx->stop = true;
+    pthread_cond_signal(&t->ctx->wait_cond);
+    pthread_mutex_unlock(&t->ctx->wait_lock);
+
+    return 0;
+}
+
 static int mcslib_client_gc(lua_State *L) {
     struct mcs_func_client *c = luaL_checkudata(L, -1, "mcs.client");
     // check routine just in case GC is called multiple times.
@@ -2668,6 +2688,7 @@ static void register_lua_libs(lua_State *L) {
         {"write", mcslib_write},
         {"flush", mcslib_flush},
         {"read", mcslib_read},
+        {"stop", mcslib_stop},
         // object functions.
         {"resline", mcslib_resline},
         {"res_ntokens", mcslib_res_ntokens},
