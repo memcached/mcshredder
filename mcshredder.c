@@ -34,6 +34,7 @@
 #include <lualib.h>
 #include <lauxlib.h>
 
+#include <sys/eventfd.h>
 #include <liburing.h>
 #include <poll.h> // POLLOUT for liburing.
 
@@ -48,6 +49,7 @@
 // avoiding some hacks for finding member size.
 #define SOCK_MAX 100
 
+#define BUF_INITIAL_SIZE 1<<15
 #define WBUF_INITIAL_SIZE 16384
 #define RBUF_INITIAL_SIZE 65536
 
@@ -122,6 +124,7 @@ enum mcs_func_state {
     mcs_fstate_rerun,
     mcs_fstate_restart,
     mcs_fstate_syserr,
+    mcs_fstate_outwait,
     mcs_fstate_sleep,
     mcs_fstate_stop,
 };
@@ -131,11 +134,23 @@ enum mcs_lua_yield {
     mcs_luayield_flush,
     mcs_luayield_read,
     mcs_luayield_sleep,
+    mcs_luayield_outwait,
     mcs_luayield_c_conn,
     mcs_luayield_c_read,
     mcs_luayield_c_readline,
     mcs_luayield_c_write,
     mcs_luayield_c_flush,
+};
+
+// Should be able to accommodate the rbuf/wbuf used in clients.
+// Not replacing them as of this writing. Should be separate change.
+struct mcs_buf {
+    int used;
+    int sent;
+    int toconsume;
+    size_t size;
+    char *buf;
+    pthread_mutex_t lock;
 };
 
 struct mcs_func_req {
@@ -214,6 +229,10 @@ struct mcs_ctx {
     thread_head_t threads; // stack of threads
     pthread_cond_t wait_cond; // thread completion signal
     pthread_mutex_t wait_lock;
+    struct mcs_buf out_buf; // out/listener stream buffer.
+    eventfd_t out_fd;
+    uint64_t out_readvar; // let io_uring put eventfd res somewhere.
+    bool out_listener; // short circuit if there's no listener.
     int active_threads; // return from shredder() if threads stopped
     int arg_ref; // commandline argument table
     const char *conffile;
@@ -420,6 +439,23 @@ static int _evset_read(struct mcs_func *f, struct mcs_func_client *c) {
     return 0;
 }
 
+static int _evset_read_eventfd(struct mcs_func *f) {
+    struct io_uring_sqe *sqe;
+    struct mcs_ctx *ctx = f->parent->ctx;
+
+    sqe = io_uring_get_sqe(&f->parent->ring);
+    if (sqe == NULL) {
+        return -1;
+    }
+
+    io_uring_prep_read(sqe, ctx->out_fd, &ctx->out_readvar, sizeof(uint64_t), 0);
+    io_uring_sqe_set_data(sqe, &f->ev);
+
+    // no timeout; block forever.
+
+    return 0;
+}
+
 static int _evset_cancel(struct mcs_func *f) {
     struct io_uring_sqe *sqe;
 
@@ -435,6 +471,25 @@ static int _evset_cancel(struct mcs_func *f) {
 }
 
 // *** CORE ***
+
+// For this codebase these buffers tend to settle into a certain size,
+// and we don't shrink them. Increasing by chunks of the original size should
+// help avoid memory bloat.
+static void mcs_check_buf(struct mcs_buf *b, size_t len) {
+    if (b->used + len <= b->size) {
+        return;
+    }
+
+    while (b->used + len > b->size) {
+        b->size += BUF_INITIAL_SIZE;
+    }
+    char *nb = realloc(b->buf, b->size);
+    if (nb == NULL) {
+        fprintf(stderr, "Failed to realloc buffer buffer\n");
+        abort();
+    }
+    b->buf = nb;
+}
 
 static void mcs_expand_rbuf(struct mcs_func_client *c) {
     if (c->rbuf_used == c->rbuf_size) {
@@ -899,6 +954,14 @@ static int mcs_cfunc_run(void *udata) {
             f->lua_nargs = 2;
             f->state = mcs_fstate_run;
             break;
+        case mcs_fstate_outwait:
+            if (_evset_read_eventfd(f) == 0) {
+                f->state = mcs_fstate_run;
+                stop = true;
+            } else {
+                return -1;
+            }
+            break;
         case mcs_fstate_run:
             if (mcs_func_lua(f)) {
                 f->state = mcs_fstate_stop;
@@ -1057,6 +1120,9 @@ static int mcs_func_lua_yield(struct mcs_func *f, int nresults) {
         case mcs_luayield_sleep:
             mcs_set_sleep(f);
             f->state = mcs_fstate_sleep;
+            break;
+        case mcs_luayield_outwait:
+            f->state = mcs_fstate_outwait;
             break;
         case mcs_luayield_c_conn:
             f->state = mcs_fstate_connecting;
@@ -1878,6 +1944,140 @@ static int mcslib_sleep_millis(lua_State *L) {
     return lua_yield(L, 1);
 }
 
+static int mcslib_out_wait(lua_State *L) {
+    lua_pushinteger(L, mcs_luayield_outwait);
+    return lua_yield(L, 1);
+}
+
+// max number of lines we can atomically output at once.
+// hard to dump a full set of stats at once, but that's probably not what this
+// is for.
+// Might have to rethink otherwise.
+#define OUT_MAXLINES 64
+
+// If first argument is a table, iterate through and copy into result buffer.
+// Adds \n if line doesn't end with one.
+// For multiple args, appends strings via \t (like lua print) and caps with
+// \n if missing.
+// Table must be an array type.
+static int mcslib_out(lua_State *L) {
+    struct mcs_thread *t = *(struct mcs_thread **)lua_getextraspace(L);
+    struct mcs_ctx *ctx = t->ctx;
+    struct mcs_buf *ob = &ctx->out_buf;
+    int argc = lua_gettop(L);
+    size_t sizes[OUT_MAXLINES];
+    const char *lines[OUT_MAXLINES];
+    size_t newlen = 0;
+    int count = 0;
+    bool table = false;
+    // We do the lua bits before locking the buffer because any lua related
+    // failure would cause us to jump out of the function with the lock held.
+
+    if (argc == 1 && lua_type(L, 1) == LUA_TTABLE) {
+        int tlen = lua_rawlen(L, 1);
+        if (tlen > OUT_MAXLINES) {
+            tlen = OUT_MAXLINES;
+        }
+        for (int x = 1; x <= tlen; x++) {
+            size_t len;
+            lua_rawgeti(L, 1, x);
+            lines[x-1] = luaL_tolstring(L, -1, &len);
+            sizes[x-1] = len;
+            newlen += len;
+        }
+        table = true;
+        newlen += tlen * 2;
+        count = tlen;
+    } else {
+        if (argc > OUT_MAXLINES) {
+            argc = OUT_MAXLINES;
+        }
+        for (int x = 1; x <= argc; x++) {
+            size_t len;
+            const char *arg = luaL_tolstring(L, x, &len);
+            sizes[x-1] = len;
+            lines[x-1] = arg;
+            newlen += len;
+        }
+        newlen += argc * 2;
+        count = argc;
+    }
+
+    pthread_mutex_lock(&ctx->out_buf.lock);
+    mcs_check_buf(ob, newlen);
+    char *p = ob->buf + ob->used;
+    char *start = p;
+    bool more = false;
+
+    // expecting each entry in the table is its own line.
+    for (int x = 0; x < count; x++) {
+        if (!table && more) {
+            *p = '\t';
+            p++;
+        }
+        memcpy(p, lines[x], sizes[x]);
+        p += sizes[x];
+        if (table && *(p-1) != '\n') {
+            *p = '\n';
+            p++;
+        }
+
+        more = true;
+    }
+    if (*(p-1) != '\n') {
+        *p = '\n';
+        p++;
+    }
+
+    ob->used += p - start;
+
+    // notify.
+    uint64_t u = 1;
+    if (write(ctx->out_fd, &u, sizeof(uint64_t)) != sizeof(uint64_t)) {
+        perror("Failed to write to eventfd somehow");
+        abort();
+    }
+    pthread_mutex_unlock(&ctx->out_buf.lock);
+
+    return 0;
+}
+
+// TODO: could perf-golf this by ticking toconsume and avoiding memmove here.
+// in mcs.out do the memmove if toconsume is nonzero. Lets the reader
+// fast-loop without memmove'ing.
+// Realistically there aren't enough lines moving through this thing to
+// matter.
+static int mcslib_out_readline(lua_State *L) {
+    struct mcs_thread *t = *(struct mcs_thread **)lua_getextraspace(L);
+    struct mcs_ctx *ctx = t->ctx;
+    struct mcs_buf *ob = &ctx->out_buf;
+
+    // Technically a bit sketchy since we call lua with the lock held, but I
+    // doubt this will fail in practice.
+    // A potential fix is to lock twice: once to find the end string and again
+    // to memmove afterward... but if we have multiple readers this will break
+    // too.
+    pthread_mutex_lock(&ob->lock);
+    if (ob->used > 0) {
+        char *end = memchr(ob->buf, '\n', ob->used);
+        if (end != NULL) {
+            size_t len = end - ob->buf;
+            lua_pushlstring(L, ob->buf, len); // strip the \n
+            ob->used -= len+1; // but remember to skip it.
+            if (ob->used) {
+                memmove(ob->buf, ob->buf+len, ob->used);
+            }
+        } else {
+            lua_pushnil(L);
+        }
+    } else {
+        lua_pushnil(L);
+    }
+    pthread_mutex_unlock(&ob->lock);
+
+    return 1;
+}
+
 // A mouthful of a name for a very specific accelerator function.
 // Takes destination client, res object
 static int mcslib_client_write_mgres_to_ms(lua_State *L) {
@@ -2450,8 +2650,6 @@ static void register_lua_libs(lua_State *L) {
         {"add_custom", mcslib_add_custom},
         {"run", mcslib_add}, // FIXME: remove this in a week.
         {"shredder", mcslib_shredder},
-        {"time_millis", mcslib_time_millis},
-        {"sleep_millis", mcslib_sleep_millis},
         // custom func functions.
         {"client_new", mcslib_client_new},
         {"client_connect", mcslib_client_connect},
@@ -2462,6 +2660,11 @@ static void register_lua_libs(lua_State *L) {
         {"client_connected", mcslib_client_connected},
         {"client_write_mgres_to_ms", mcslib_client_write_mgres_to_ms},
         // func functions.
+        {"time_millis", mcslib_time_millis},
+        {"sleep_millis", mcslib_sleep_millis},
+        {"out", mcslib_out},
+        {"out_wait", mcslib_out_wait},
+        {"out_readline", mcslib_out_readline},
         {"write", mcslib_write},
         {"flush", mcslib_flush},
         {"read", mcslib_read},
@@ -2565,6 +2768,14 @@ int main(int argc, char **argv) {
     struct mcs_ctx *ctx = calloc(1, sizeof(struct mcs_ctx));
     pthread_mutex_init(&ctx->wait_lock, NULL);
     pthread_cond_init(&ctx->wait_cond, NULL);
+    pthread_mutex_init(&ctx->out_buf.lock, NULL);
+    ctx->out_fd = eventfd(0, EFD_NONBLOCK);
+    if (ctx->out_fd == -1) {
+        perror("failed to create notify eventfd");
+        exit(EXIT_FAILURE);
+    }
+    ctx->out_buf.buf = malloc(BUF_INITIAL_SIZE);
+    ctx->out_buf.size = BUF_INITIAL_SIZE;
 
     // - create main VM
     lua_State *L = luaL_newstate();
