@@ -1483,6 +1483,7 @@ static int mcslib_add(lua_State *L) {
 
     int clients = 1;
     int limit = 0;
+    bool use_init = false;
     struct mcs_f_rate frate = {0};
     struct mcs_f_reconn freconn = {0};
 
@@ -1518,6 +1519,11 @@ static int mcslib_add(lua_State *L) {
     if (lua_getfield(L, 2, "limit") != LUA_TNIL) {
         limit = lua_tointeger(L, -1) / threadcount;
         limit++; // first run counts against the limiter.
+    }
+    lua_pop(L, 1);
+
+    if (lua_getfield(L, 2, "init") != LUA_TNIL) {
+        use_init = lua_toboolean(L, -1);
     }
     lua_pop(L, 1);
 
@@ -1560,9 +1566,27 @@ static int mcslib_add(lua_State *L) {
                 f->arg_ref = luaL_ref(t->L, LUA_REGISTRYINDEX);
             }
 
+            // TODO: move this to a helper func.
             lua_getglobal(t->L, fname);
             if (lua_isnil(t->L, -1)) {
-                luaL_error(L, "mcs.add configuration missing '%s' function", fname);
+                luaL_error(t->L, "mcs.add configuration missing '%s' function", fname);
+            }
+            if (use_init) {
+                int acount = 0;
+                // We immediately call the function and use the result
+                // function for what we actually call.
+                if (arg) {
+                    lua_pushvalue(t->L, arg);
+                    acount = 1;
+                }
+                if (lua_pcall(t->L, acount, 1, 0) != LUA_OK) {
+                    luaL_error(t->L, "mcs.add failed to call '%s' function for init: %s", fname, lua_tostring(L, -1));
+                }
+                if (lua_type(t->L, -1) != LUA_TFUNCTION) {
+                    luaL_error(t->L, "mcs.add init function '%s' must return a function", fname);
+                }
+                // function and arguments are removed from stack, leaving the
+                // final function for us to reference below.
             }
             f->func_ref = luaL_ref(t->L, LUA_REGISTRYINDEX);
 
