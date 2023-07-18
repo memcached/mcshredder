@@ -32,7 +32,8 @@ function warm()
     local req = mcs.set(prefix, counter, 0, 9999, vsize)
     mcs.write(req)
     mcs.flush()
-    local res = mcs.read()
+    local res = mcs.res_new()
+    mcs.read(res)
     counter = counter + 1
 end
 
@@ -41,13 +42,14 @@ function basic(a)
     local pfx = a.prefix
     local size = a.vsize
     local req = mcs.mg_factory(pfx, "v")
+    local res = mcs.res_new()
 
     return function()
         local num = math.random(total)
         mcs.write_factory(req, num)
         mcs.flush()
 
-        local res = mcs.read()
+        mcs.read(res)
 --[[       local rline = mcs.resline(res)
         if rline == "EN" then
             local set = mcs.set(prefix, num, 0, 30, size)
@@ -69,7 +71,8 @@ function basic_noinit(a)
     mcs.write(req)
     mcs.flush()
 
-    local res = mcs.read()
+    local res = mcs.res_new()
+    mcs.read(res)
 --[[
     local rline = mcs.resline(res)
     if rline == "EN" then
@@ -87,7 +90,8 @@ function timer()
     mcs.write(req)
     mcs.flush()
 
-    local res = mcs.read()
+    local res = mcs.res_new()
+    mcs.read(res)
     local status, elapsed = mcs.match(req, res)
     print("elapsed response: " .. elapsed)
 
@@ -95,10 +99,10 @@ function timer()
         local set = mcs.set(prefix, num, 0, 30, vsize)
         mcs.write(set)
         mcs.flush()
-        local res = mcs.read()
+        mcs.read(res)
     else
         -- pull the END
-        local res = mcs.read()
+        mcs.read(res)
     end
 end
 
@@ -109,8 +113,9 @@ function statsample()
     mcs.write("stats\r\n")
     mcs.flush()
     local stats = {}
+    local res = mcs.res_new()
     while true do
-        local res = mcs.read()
+        mcs.read(res)
         if mcs.resline(res) == "END" then
             break
         end

@@ -645,13 +645,11 @@ static int mcs_read_buf(struct mcs_func *f, struct mcs_func_client *c) {
     char *rbuf_offset = c->rbuf + c->rbuf_toconsume;
     int rbuf_remain = c->rbuf_used - c->rbuf_toconsume;
     if (f->buf_readline == 0) {
-        // optimistically allocate a response to minimize data copying.
-        struct mcs_func_resp *r = lua_newuserdatauv(f->L, sizeof(struct mcs_func_resp), 0);
+        struct mcs_func_resp *r = lua_touserdata(f->L, -1);
         memset(r, 0, sizeof(*r));
         r->status = mcmc_parse_buf(rbuf_offset, rbuf_remain, &r->resp);
         if (r->status == MCMC_OK) {
             if (r->resp.vlen != r->resp.vlen_read) {
-                lua_pop(f->L, 1); // throw away the resp object, try re-parsing later
                 if (c->rbuf_toconsume != 0) {
                     // vlen didn't fit, but we are read partway into the
                     // buffer.
@@ -670,7 +668,6 @@ static int mcs_read_buf(struct mcs_func *f, struct mcs_func_client *c) {
                 clock_gettime(CLOCK_MONOTONIC, &r->received);
             }
         } else if (r->resp.code == MCMC_WANT_READ) {
-            lua_pop(f->L, 1);
             mcs_expand_rbuf(c);
             ret = 1;
         } else {
@@ -2034,8 +2031,9 @@ static int mcslib_client_connect(lua_State *L) {
 // client object.
 static int mcslib_client_read(lua_State *L) {
     luaL_checktype(L, 1, LUA_TUSERDATA);
+    luaL_checktype(L, 2, LUA_TUSERDATA);
     lua_pushinteger(L, mcs_luayield_c_read);
-    return lua_yield(L, 2);
+    return lua_yield(L, 3);
 }
 
 // yield and read with a special handler that just looks for \r\n.
@@ -2090,8 +2088,9 @@ static int mcslib_flush(lua_State *L) {
 }
 
 static int mcslib_read(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TUSERDATA);
     lua_pushinteger(L, mcs_luayield_read);
-    return lua_yield(L, 1);
+    return lua_yield(L, 2);
 }
 
 static int mcslib_sleep_millis(lua_State *L) {
@@ -2348,6 +2347,13 @@ static int mcslib_resline(lua_State *L) {
         len -= 2;
     }
     lua_pushlstring(L, r->buf, len);
+    return 1;
+}
+
+// just return the empty result object.
+static int mcslib_res_new(lua_State *L) {
+    struct mcs_func_resp *r = lua_newuserdatauv(L, sizeof(struct mcs_func_resp), 0);
+    memset(r, 0, sizeof(*r));
     return 1;
 }
 
@@ -2884,6 +2890,7 @@ static void register_lua_libs(lua_State *L) {
         {"stop", mcslib_stop},
         // object functions.
         {"resline", mcslib_resline},
+        {"res_new", mcslib_res_new},
         {"res_ntokens", mcslib_res_ntokens},
         {"res_token", mcslib_res_token},
         {"res_split", mcslib_res_split},
