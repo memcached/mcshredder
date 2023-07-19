@@ -2356,6 +2356,20 @@ static int mcslib_res_new(lua_State *L) {
     return 1;
 }
 
+// static/const strings passed in avoid allocations in lua.
+static int mcslib_res_startswith(lua_State *L) {
+    size_t len = 0;
+    struct mcs_func_resp *r = lua_touserdata(L, 1);
+    const char *str = lua_tolstring(L, 2, &len);
+
+    if (r->resp.reslen >= len && (strncmp(r->buf, str, len) == 0)) {
+        lua_pushboolean(L, 1);
+    } else {
+        lua_pushboolean(L, 0);
+    }
+    return 1;
+}
+
 static int mcslib_res_len(lua_State *L) {
     struct mcs_func_resp *r = lua_touserdata(L, -1);
     lua_pushinteger(L, r->resp.reslen + r->resp.vlen);
@@ -2890,6 +2904,7 @@ static void register_lua_libs(lua_State *L) {
         // object functions.
         {"resline", mcslib_resline},
         {"res_new", mcslib_res_new},
+        {"res_startswith", mcslib_res_startswith},
         {"res_ntokens", mcslib_res_ntokens},
         {"res_token", mcslib_res_token},
         {"res_split", mcslib_res_split},

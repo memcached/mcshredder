@@ -50,14 +50,15 @@ function basic(a)
         mcs.flush()
 
         mcs.read(res)
---[[       local rline = mcs.resline(res)
-        if rline == "EN" then
+        if mcs.res_startswith(res, "EN") then
+            print("miss")
+--[[
             local set = mcs.set(prefix, num, 0, 30, size)
             mcs.write(set)
             mcs.flush()
             local res = mcs.read()
-        end
 --]]
+        end
     end
 end
 
