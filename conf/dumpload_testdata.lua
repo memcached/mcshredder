@@ -31,6 +31,7 @@ function warm(a)
     local count = a.count
     local prefix = a.prefix
     local flusher = 0
+    local res = mcs.res_new()
 
     for i=0,count do
         local rand_cflags = math.random(50000)
@@ -60,5 +61,5 @@ function warm(a)
     -- ensure final commands were written
     mcs.write("mn\r\n")
     mcs.flush()
-    local res = mcs.read()
+    mcs.read(res)
 end

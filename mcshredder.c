@@ -662,7 +662,7 @@ static int mcs_read_buf(struct mcs_func *f, struct mcs_func_client *c) {
                 ret = 1; // WANT_READ
             } else {
                 r->buf = rbuf_offset;
-                f->lua_nargs = 1;
+                f->lua_nargs = 0;
                 c->rbuf_toconsume += r->resp.reslen + r->resp.vlen_read;
 
                 clock_gettime(CLOCK_MONOTONIC, &r->received);
@@ -679,7 +679,7 @@ static int mcs_read_buf(struct mcs_func *f, struct mcs_func_client *c) {
                     } else {
                         // SERVER_ERROR can be handled upstream
                         r->buf = rbuf_offset;
-                        f->lua_nargs = 1;
+                        f->lua_nargs = 0;
                         c->rbuf_toconsume += r->resp.reslen;
                         clock_gettime(CLOCK_MONOTONIC, &r->received);
                     }
@@ -1002,8 +1002,6 @@ static int mcs_cfunc_run(void *udata) {
             c = lua_touserdata(f->L, 1);
             mcmc_disconnect(c->mcmc);
             c->connected = false;
-            // FIXME: need better way to communicate client has errored.
-            lua_pushnil(f->L);
             lua_pushinteger(f->L, f->reserr);
             f->lua_nargs = 2;
             f->state = mcs_fstate_run;
@@ -1273,6 +1271,7 @@ static int mcs_func_lua(struct mcs_func *f) {
             // fall through to YIELD case.
         case LUA_YIELD:
             status = lua_resume(f->L, NULL, f->lua_nargs, &nresults);
+            f->lua_nargs = 0;
             if (status == LUA_OK) {
                 return 1;
             } else if (status == LUA_YIELD) {

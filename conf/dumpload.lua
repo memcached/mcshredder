@@ -392,10 +392,11 @@ function send_keys_to_dst(src_c, dst_c, window_start, bw_limit)
     -- called, so we cannot stack them. This is done to avoid extra large
     -- allocations and data copies.
     local sent_bytes = 0
+    local res = mcs.res_new()
 
     while true do
-        local res, err = mcs.client_read(src_c)
-        if res == nil then
+        local err = mcs.client_read(src_c, res)
+        if err ~= nil then
             error("ERROR: reading response from source failed: " .. err)
         end
         -- TODO: tick counter and skip write if EN
@@ -471,15 +472,17 @@ function dest_flush(dst_c)
     local done = true
     -- cap the write and flush
     mcs.client_write(dst_c, "mn\r\n")
-    local success, err = mcs.client_flush(dst_c)
-    if not success then
+    local err = mcs.client_flush(dst_c)
+    if err ~= nil then
         print("ERROR: flushing requests to dest failed: " .. err)
         return false
     end
 
+    local res = mcs.res_new()
+
     while true do
-        local res, err = mcs.client_read(dst_c)
-        if res == nil then
+        local err = mcs.client_read(dst_c, res)
+        if err ~= nil then
             print("ERROR: reading response from dest failed: " .. err)
             return false
         end
@@ -515,8 +518,8 @@ function request_src_keys(src_c, keys_in)
     end
     -- send end cap for this batch.
     mcs.client_write(src_c, "mn\r\n")
-    local success, err = mcs.client_flush(src_c)
-    if not success then
+    local err = mcs.client_flush(src_c)
+    if err ~= nil then
         error("ERROR: flushing requests to data source: " .. err)
     end
 end
