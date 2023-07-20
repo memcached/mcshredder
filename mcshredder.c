@@ -237,10 +237,28 @@ struct mcs_thread {
     STAILQ_ENTRY(mcs_thread) next; // thread stack
     func_head_t func_runlist; // queued runlist
     func_head_t func_list; // coroutine stack
-    int active_funcs; // stop if no active functions
     struct io_uring ring;
+    int active_funcs; // stop if no active functions
     pthread_t tid;
     bool stop;
+};
+
+enum mcs_memprofile_types {
+    mcs_memp_free = 0,
+    mcs_memp_string,
+    mcs_memp_table,
+    mcs_memp_func,
+    mcs_memp_userdata,
+    mcs_memp_thread,
+    mcs_memp_default,
+    mcs_memp_realloc,
+};
+
+struct mcs_memprofile {
+    struct timespec last_status; // for per-second prints on status
+    int id;
+    uint64_t allocs[8];
+    uint64_t alloc_bytes[8];
 };
 
 typedef STAILQ_HEAD(thread_head_s, mcs_thread) thread_head_t;
@@ -252,10 +270,12 @@ struct mcs_ctx {
     struct mcs_buf out_buf; // out/listener stream buffer.
     eventfd_t out_fd;
     uint64_t out_readvar; // let io_uring put eventfd res somewhere.
+    bool memprofile; // runs threads with a memory profiler.
     bool out_listener; // short circuit if there's no listener.
     bool stop; // some thread told us to cut out of the shredder.
     int active_threads; // return from shredder() if threads stopped
     int arg_ref; // commandline argument table
+    int thread_counter; // to give ID's for the memory profiler.
     const char *conffile;
     struct mcs_conn conn; // connection details.
 };
@@ -271,41 +291,84 @@ static void timespec_add(struct __kernel_timespec *ts1,
     }
 }
 
-#ifdef MCS_ALLOC_PROFILE
-static void *profile_alloc (void *ud, void *ptr, size_t osize,
+static void *profile_alloc(void *ud, void *ptr, size_t osize,
                                             size_t nsize) {
-   (void)ud;  (void)osize;  /* not used */
-   if (ptr == NULL) {
+    struct mcs_memprofile *prof = ud;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    enum mcs_memprofile_types t = mcs_memp_free;
+    if (ptr == NULL) {
         switch (osize) {
             case LUA_TSTRING:
-                fprintf(stderr, "alloc string: %ld\n", nsize);
+                t = mcs_memp_string;
+                //fprintf(stderr, "alloc string: %ld\n", nsize);
                 break;
             case LUA_TTABLE:
-                fprintf(stderr, "alloc table: %ld\n", nsize);
+                t = mcs_memp_table;
+                //fprintf(stderr, "alloc table: %ld\n", nsize);
                 break;
             case LUA_TFUNCTION:
-                fprintf(stderr, "alloc func: %ld\n", nsize);
+                t = mcs_memp_func;
+                //fprintf(stderr, "alloc func: %ld\n", nsize);
                 break;
             case LUA_TUSERDATA:
-                fprintf(stderr, "alloc userdata: %ld\n", nsize);
+                t = mcs_memp_userdata;
+                //fprintf(stderr, "alloc userdata: %ld\n", nsize);
                 break;
             case LUA_TTHREAD:
-                fprintf(stderr, "alloc thread: %ld\n", nsize);
+                t = mcs_memp_thread;
+                //fprintf(stderr, "alloc thread: %ld\n", nsize);
                 break;
             default:
-                fprintf(stderr, "alloc osize: %ld nsize: %ld\n", osize, nsize);
+                t = mcs_memp_default;
+                //fprintf(stderr, "alloc osize: %ld nsize: %ld\n", osize, nsize);
         }
-   } else {
-       fprintf(stderr, "realloc: osize: %ld nsize: %ld\n", osize, nsize);
-   }
-   if (nsize == 0) {
-     free(ptr);
-     return NULL;
-   } else {
-     return realloc(ptr, nsize);
-   }
+        prof->allocs[t]++;
+        prof->alloc_bytes[t] += nsize;
+    } else {
+        if (nsize != 0) {
+            prof->allocs[mcs_memp_realloc]++;
+            prof->alloc_bytes[mcs_memp_realloc] += nsize;
+        } else {
+            prof->allocs[mcs_memp_free]++;
+            prof->alloc_bytes[mcs_memp_free] += osize;
+        }
+        //fprintf(stderr, "realloc: osize: %ld nsize: %ld\n", osize, nsize);
+    }
+
+    if (now.tv_sec != prof->last_status.tv_sec) {
+        prof->last_status.tv_sec = now.tv_sec;
+        fprintf(stderr, "MEMPROF[%d]:\tstring[%llu][%llu] table[%llu][%llu] func[%llu][%llu] udata[%llu][%llu] thr[%llu][%llu] def[%llu][%llu] realloc[%llu][%llu] free[%llu][%llu]\n",
+                prof->id,
+                (unsigned long long)prof->allocs[1],
+                (unsigned long long)prof->alloc_bytes[1],
+                (unsigned long long)prof->allocs[2],
+                (unsigned long long)prof->alloc_bytes[2],
+                (unsigned long long)prof->allocs[3],
+                (unsigned long long)prof->alloc_bytes[3],
+                (unsigned long long)prof->allocs[4],
+                (unsigned long long)prof->alloc_bytes[4],
+                (unsigned long long)prof->allocs[5],
+                (unsigned long long)prof->alloc_bytes[5],
+                (unsigned long long)prof->allocs[6],
+                (unsigned long long)prof->alloc_bytes[6],
+                (unsigned long long)prof->allocs[7],
+                (unsigned long long)prof->alloc_bytes[7],
+                (unsigned long long)prof->allocs[0],
+                (unsigned long long)prof->alloc_bytes[0]);
+        for (int x = 0; x < 8; x++) {
+            prof->allocs[x] = 0;
+            prof->alloc_bytes[x] = 0;
+        }
+    }
+
+    if (nsize == 0) {
+        free(ptr);
+        return NULL;
+    } else {
+        return realloc(ptr, nsize);
+    }
 }
-#endif
 
 // Common lua debug command.
 __attribute__((unused)) void dump_stack(lua_State *L) {
@@ -1427,11 +1490,13 @@ static int mcslib_thread(lua_State *L) {
 
     t->ctx = ctx;
     t->active_funcs = 0;
-#ifdef MCS_ALLOC_PROFILE
-    t->L = lua_newstate(profile_alloc, NULL);
-#else
-    t->L = luaL_newstate();
-#endif
+    if (ctx->memprofile) {
+        struct mcs_memprofile *prof = calloc(1, sizeof(struct mcs_memprofile));
+        prof->id = ctx->thread_counter++;
+        t->L = lua_newstate(profile_alloc, prof);
+    } else {
+        t->L = luaL_newstate();
+    }
     // allow in-thread functions to access both the parent thread and ctx
     struct mcs_thread **extra = lua_getextraspace(t->L);
     *extra = t;
@@ -2974,6 +3039,7 @@ static void usage(struct mcs_ctx *ctx) {
            "--port=<port> (11211): Port to connect to\n"
            "--conf=<file> (none): Lua configuration file\n"
            "--arg=<key,key=val,key2=val2> (none): arguments to pass to config script\n"
+           "--memprofile: print allocation statistics once per second\n"
           );
     lua_getglobal(ctx->L, "help");
     if (!lua_isnil(ctx->L, -1)) {
@@ -2991,6 +3057,7 @@ int main(int argc, char **argv) {
         {"sock", required_argument, 0, 's'},
         {"conf", required_argument, 0, 'c'},
         {"arg", required_argument, 0, 'a'},
+        {"memprofile", no_argument, 0, 'm'},
         {"help", no_argument, 0, 'h'},
         // end
         {0, 0, 0, 0}
@@ -3044,6 +3111,9 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Failed to load config file: %s\n", lua_tostring(L, -1));
                 exit(EXIT_FAILURE);
             }
+            break;
+        case 'm':
+            ctx->memprofile = true;
             break;
         case 'h':
             usage(ctx);
