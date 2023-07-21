@@ -155,29 +155,33 @@ struct mcs_buf {
     pthread_mutex_t lock;
 };
 
-struct mcs_func_req {
-    struct timespec start;
-    int len;
-    int vlen;
-    uint64_t hash; // hash of the key, used to match the value.
-    char data[];
+enum mcs_req_type {
+    mcs_req_type_flat = 0,
+    mcs_req_type_factory = 1,
 };
 
 // factories can have at most one outstanding request at a time if you want to
 // use response matching.
 // if pipelining requests, pre-make N factories.
-struct mcs_func_req_factory {
-    // these next few are updated on the factory use so we can match a
-    // response object.
+#define FACTORY_LENGTH KEY_MAX_LENGTH + REQ_MAX_LENGTH + 2
+struct mcs_func_req {
+    enum mcs_req_type type;
     struct timespec start;
     uint64_t hash;
-    int64_t numeric; // numeric component of key
-    // everything below here should be static after creation.
-    char cmd;
-    int prefix_len;
-    int postfix_len;
-    char prefix[KEY_MAX_LENGTH+1];
-    char postfix[REQ_MAX_LENGTH+1]; // any flags get bound together here.
+    union {
+        struct {
+            int len;
+            int vlen;
+        } flat;
+        struct {
+            int64_t numeric;
+            char cmd;
+            int prefix_len;
+            int postfix_len;
+            // prefix/postfix are in data[]
+        } fac;
+    };
+    char data[];
 };
 
 // points into func's rbuf
@@ -1108,13 +1112,13 @@ static int mcs_cfunc_run(void *udata) {
 // the same value can miss a few classes of bugs.
 static void _mcs_write_value(struct mcs_func_req *r, struct mcs_func_client *c) {
     uint64_t hash = r->hash;
-    for (int x = 0; x < r->vlen / sizeof(hash); x++) {
+    for (int x = 0; x < r->flat.vlen / sizeof(hash); x++) {
         memcpy(c->wbuf + c->wbuf_used, &hash, sizeof(hash));
         hash++;
         c->wbuf_used += sizeof(hash);
     }
 
-    int remain = r->vlen % sizeof(hash);
+    int remain = r->flat.vlen % sizeof(hash);
     for (int x = 0; x < remain; x++) {
         c->wbuf[c->wbuf_used] = '#';
         c->wbuf_used++;
@@ -1153,9 +1157,9 @@ static int mcslib_write_c(struct mcs_func *f, struct mcs_func_client *c) {
 
     if (type == LUA_TUSERDATA) {
         req = lua_touserdata(f->L, -1);
-        len = req->len;
+        len = req->flat.len;
         rline = req->data;
-        vlen = req->vlen;
+        vlen = req->flat.vlen;
         clock_gettime(CLOCK_MONOTONIC, &req->start);
     } else if (type == LUA_TSTRING) {
         rline = luaL_tolstring(f->L, -1, &len);
@@ -1177,7 +1181,7 @@ static int mcslib_write_c(struct mcs_func *f, struct mcs_func_client *c) {
 // uses the passed factory and numeric to write request into the client
 // write buffer.
 static int mcslib_write_c_factory(struct mcs_func *f, struct mcs_func_client *c) {
-    struct mcs_func_req_factory *req = lua_touserdata(f->L, -2);
+    struct mcs_func_req *req = lua_touserdata(f->L, -2);
 
     mcs_expand_wbuf(c, REQ_MAX_LENGTH);
 
@@ -1185,23 +1189,23 @@ static int mcslib_write_c_factory(struct mcs_func *f, struct mcs_func_client *c)
     char *start = p;
 
     memcpy(p, "m  ", 3);
-    p[1] = req->cmd;
+    p[1] = req->fac.cmd;
     p += 3;
     char *key = p;
 
-    memcpy(p, req->prefix, req->prefix_len);
-    p += req->prefix_len;
+    memcpy(p, req->data, req->fac.prefix_len);
+    p += req->fac.prefix_len;
 
-    req->numeric = lua_tointeger(f->L, -1);
-    if (req->numeric > -1) {
-        p = itoa_64(req->numeric, p);
+    req->fac.numeric = lua_tointeger(f->L, -1);
+    if (req->fac.numeric > -1) {
+        p = itoa_64(req->fac.numeric, p);
     }
     int klen = p - key;
     req->hash = XXH3_64bits(key, klen);
 
     // should include the \r\n terminator.
-    memcpy(p, req->postfix, req->postfix_len);
-    p += req->postfix_len;
+    memcpy(p, req->data + req->fac.prefix_len, req->fac.postfix_len);
+    p += req->fac.postfix_len;
 
     clock_gettime(CLOCK_MONOTONIC, &req->start);
     c->wbuf_used += p - start;
@@ -2615,8 +2619,8 @@ static int mcslib_get(lua_State *L) {
     memcpy(p, "\r\n", 2);
     p += 2;
 
-    req->len = p - req->data;
-    req->vlen = 0;
+    req->flat.len = p - req->data;
+    req->flat.vlen = 0;
 
     return 1;
 }
@@ -2649,8 +2653,8 @@ static int mcslib_delete(lua_State *L) {
     memcpy(p, "\r\n", 2);
     p += 2;
 
-    req->len = p - req->data;
-    req->vlen = 0;
+    req->flat.len = p - req->data;
+    req->flat.vlen = 0;
 
     return 1;
 }
@@ -2688,8 +2692,8 @@ static int mcslib_touch(lua_State *L) {
     memcpy(p, "\r\n", 2);
     p += 2;
 
-    req->len = p - req->data;
-    req->vlen = 0;
+    req->flat.len = p - req->data;
+    req->flat.vlen = 0;
 
     return 1;
 }
@@ -2733,13 +2737,13 @@ static int mcslib_set(lua_State *L) {
     *p = ' ';
     p++;
 
-    req->vlen = lua_tointeger(L, 5);
-    p = itoa_32(req->vlen, p);
+    req->flat.vlen = lua_tointeger(L, 5);
+    p = itoa_32(req->flat.vlen, p);
 
     memcpy(p, "\r\n", 2);
     p += 2;
 
-    req->len = p - req->data;
+    req->flat.len = p - req->data;
 
     return 1;
 }
@@ -2775,8 +2779,8 @@ static int mcslib_ms(lua_State *L) {
     *p = ' ';
     p++;
 
-    req->vlen = lua_tointeger(L, 3);
-    p = itoa_32(req->vlen, p);
+    req->flat.vlen = lua_tointeger(L, 3);
+    p = itoa_32(req->flat.vlen, p);
 
     for (int x = 4; x < argc; x++) {
         const char *flags = lua_tolstring(L, x, &len);
@@ -2791,7 +2795,7 @@ static int mcslib_ms(lua_State *L) {
     memcpy(p, "\r\n", 2);
     p += 2;
 
-    req->len = p - req->data;
+    req->flat.len = p - req->data;
 
     return 1;
 }
@@ -2841,8 +2845,8 @@ static int _mcslib_basic(lua_State *L, char cmd) {
     memcpy(p, "\r\n", 2);
     p += 2;
 
-    req->len = p - req->data;
-    req->vlen = 0;
+    req->flat.len = p - req->data;
+    req->flat.vlen = 0;
 
     return 1;
 }
@@ -2860,19 +2864,22 @@ static int mcslib_ma(lua_State *L) {
 }
 
 static int _mcslib_basic_factory(lua_State *L, char cmd) {
-    struct mcs_func_req_factory *req = lua_newuserdatauv(L, sizeof(struct mcs_func_req_factory), 0);
+    struct mcs_func_req *req = lua_newuserdatauv(L, sizeof(struct mcs_func_req) + FACTORY_LENGTH, 0);
     int argc = lua_gettop(L);
 
     size_t len = 0;
+    req->type = mcs_req_type_factory;
     const char *pfx = lua_tolstring(L, 1, &len);
 
-    req->cmd = cmd;
+    req->fac.cmd = cmd;
+
+    char *p = req->data;
 
     // TODO: we can afford to do more thorough argument checking here.
-    memcpy(req->prefix, pfx, len);
-    req->prefix_len = len;
+    memcpy(p, pfx, len);
+    req->fac.prefix_len = len;
+    p += len;
 
-    char *p = req->postfix;
     char *start = p;
     for (int x = 2; x < argc; x++) {
         const char *flags = lua_tolstring(L, x, &len);
@@ -2887,7 +2894,7 @@ static int _mcslib_basic_factory(lua_State *L, char cmd) {
     memcpy(p, "\r\n", 2);
     p += 2;
 
-    req->postfix_len = p - start;
+    req->fac.postfix_len = p - start;
 
     return 1;
 }
