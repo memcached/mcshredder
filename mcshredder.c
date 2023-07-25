@@ -1667,6 +1667,9 @@ static int mcslib_add(lua_State *L) {
 
     if (lua_getfield(L, 2, "rate_limit") != LUA_TNIL) {
         frate.rate = lua_tointeger(L, -1) / threadcount;
+        if (frate.rate == 0) {
+            frate.rate = 1;
+        }
     }
     lua_pop(L, 1);
 
