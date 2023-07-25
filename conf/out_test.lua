@@ -3,10 +3,22 @@ function config()
     local tout = mcs.thread()
 
     -- test sending the messages across threads.
-    mcs.add_custom(t, { func = "sender" })
+    --mcs.add_custom(t, { func = "sender" })
+    mcs.add_custom(t, { func = "tablesender" })
     mcs.add_custom(tout, { func = "receiver" })
 
     mcs.shredder({t, tout}, 30)
+end
+
+function tablesender()
+    while true do
+        local t = {"===start==="}
+        table.insert(t, "next")
+        table.insert(t, "more")
+        table.insert(t, "===end===")
+        mcs.out(t)
+        mcs.sleep_millis(1000)
+    end
 end
 
 function sender()

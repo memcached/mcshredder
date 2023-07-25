@@ -2287,7 +2287,7 @@ static int mcslib_out_readline(lua_State *L) {
             lua_pushlstring(L, ob->buf, len); // strip the \n
             ob->used -= len+1; // but remember to skip it.
             if (ob->used) {
-                memmove(ob->buf, ob->buf+len, ob->used);
+                memmove(ob->buf, ob->buf+len+1, ob->used);
             }
         } else {
             lua_pushnil(L);
