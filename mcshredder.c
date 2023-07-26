@@ -77,6 +77,7 @@ static void register_lua_libs(lua_State *L);
 static void mcs_queue_cb(void *udata, struct io_uring_cqe *cqe);
 static int mcs_func_lua(struct mcs_func *f);
 static void mcs_start_limiter(struct mcs_func *f);
+static void _mcs_cleanup_thread(struct mcs_thread *t);
 
 typedef void (*event_cb)(void *udata, struct io_uring_cqe *cqe);
 // return -1 if failure to get sqe
@@ -1498,6 +1499,7 @@ static void *shredder_thread(void *arg) {
     pthread_cond_signal(&t->ctx->wait_cond);
     pthread_mutex_unlock(&t->ctx->wait_lock);
 
+    _mcs_cleanup_thread(t);
     return NULL;
 }
 
@@ -1870,6 +1872,8 @@ static int mcslib_add_custom(lua_State *L) {
         lua_pushvalue(t->L, arg_offset);
         f->arg_ref = luaL_ref(t->L, LUA_REGISTRYINDEX);
     }
+    // ensure we don't leak the argument table (or anything else)
+    lua_settop(t->L, 0);
 
     return 0;
 }
@@ -1891,6 +1895,7 @@ static void _mcs_cleanup_thread(struct mcs_thread *t) {
         luaL_unref(t->L, LUA_REGISTRYINDEX, f->self_ref);
         luaL_unref(t->L, LUA_REGISTRYINDEX, f->self_ref_coro);
         luaL_unref(t->L, LUA_REGISTRYINDEX, f->func_ref);
+        luaL_unref(t->L, LUA_REGISTRYINDEX, f->arg_ref);
         // do not free the function: it's owned by the lua state
     }
     STAILQ_INIT(&t->func_list);
@@ -1985,7 +1990,6 @@ static int mcslib_shredder(lua_State *L) {
     STAILQ_FOREACH(t, &ctx->threads, next) {
         // FIXME: assuming success.
         pthread_join(t->tid, NULL);
-        _mcs_cleanup_thread(t);
     }
 
     return 0;
