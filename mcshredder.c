@@ -596,6 +596,14 @@ static int _evset_cancel(struct mcs_func *f) {
 
 // *** CORE ***
 
+static int mcs_buf_used(struct mcs_buf *b) {
+    int used = 0;
+    pthread_mutex_lock(&b->lock);
+    used = b->used;
+    pthread_mutex_unlock(&b->lock);
+    return used;
+}
+
 // For this codebase these buffers tend to settle into a certain size,
 // and we don't shrink them. Increasing by chunks of the original size should
 // help avoid memory bloat.
@@ -1074,8 +1082,14 @@ static int mcs_cfunc_run(void *udata) {
             f->state = mcs_fstate_run;
             break;
         case mcs_fstate_outwait:
-            if (_evset_read_eventfd(f) == 0) {
+            // NOTE: I suspect there's still a race condition where we can end
+            // up sleeping forever. this won't happen in any normal loads as
+            // things will keep putting data on the out buffer.
+            // might need to write the total bytes into the eventfd and then
+            // read that much per wake event.
+            if (mcs_buf_used(&f->parent->ctx->out_buf) != 0) {
                 f->state = mcs_fstate_run;
+            } else if (_evset_read_eventfd(f) == 0) {
                 stop = true;
             } else {
                 return -1;
@@ -1279,7 +1293,11 @@ static int mcs_func_lua_yield(struct mcs_func *f, int nresults) {
             f->state = mcs_fstate_sleep;
             break;
         case mcs_luayield_outwait:
-            f->state = mcs_fstate_outwait;
+            if (mcs_buf_used(&f->parent->ctx->out_buf) != 0) {
+                f->state = mcs_fstate_run;
+            } else {
+                f->state = mcs_fstate_outwait;
+            }
             break;
         case mcs_luayield_c_conn:
             f->state = mcs_fstate_connecting;
