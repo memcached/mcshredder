@@ -1837,6 +1837,7 @@ static struct mcs_func *mcs_add_custom_func(struct mcs_thread *t) {
 
 static int mcslib_add_custom(lua_State *L) {
     struct mcs_ctx *ctx = *(struct mcs_ctx **)lua_getextraspace(L);
+    luaL_checktype(L, 1, LUA_TUSERDATA);
     struct mcs_thread *t = lua_touserdata(L, 1);
     luaL_checktype(L, 2, LUA_TTABLE);
     int arg_type = lua_type(L, 3);
