@@ -1125,22 +1125,22 @@ static int mcs_cfunc_run(void *udata) {
 
 // Turn the 8 byte hash into a pattern-fill for the value. Just filling with
 // the same value can miss a few classes of bugs.
-static void _mcs_write_value(struct mcs_func_req *r, struct mcs_func_client *c) {
-    uint64_t hash = r->hash;
-    for (int x = 0; x < r->flat.vlen / sizeof(hash); x++) {
-        memcpy(c->wbuf + c->wbuf_used, &hash, sizeof(hash));
+static char *_mcs_write_value(uint64_t hash, int vlen, char *p) {
+     for (int x = 0; x < vlen / sizeof(hash); x++) {
+        memcpy(p, &hash, sizeof(hash));
         hash++;
-        c->wbuf_used += sizeof(hash);
+        p += sizeof(hash);
     }
 
-    int remain = r->flat.vlen % sizeof(hash);
+    int remain = vlen % sizeof(hash);
     for (int x = 0; x < remain; x++) {
-        c->wbuf[c->wbuf_used] = '#';
-        c->wbuf_used++;
+        *p = '#';
+        p++;
     }
 
-    memcpy(c->wbuf + c->wbuf_used, "\r\n", 2);
-    c->wbuf_used += 2;
+    memcpy(p, "\r\n", 2);
+    p += 2;
+    return p;
 }
 
 // should be doing cast-comparisons since that should be a bit faster, but not
@@ -1188,15 +1188,18 @@ static int mcslib_write_c(struct mcs_func *f, struct mcs_func_client *c) {
     lua_pop(f->L, 1);
 
     if (vlen != 0) {
-        _mcs_write_value(req, c);
+        char *p = _mcs_write_value(req->hash, vlen, (char *)c->wbuf + c->wbuf_used);
+        c->wbuf_used += p - (c->wbuf + c->wbuf_used);
     }
     return 0;
 }
 
 // uses the passed factory and numeric to write request into the client
 // write buffer.
-static int mcslib_write_c_factory(struct mcs_func *f, struct mcs_func_client *c) {
-    struct mcs_func_req *req = lua_touserdata(f->L, -2);
+// for set requests, also takes the value size as a final argument.
+static int mcslib_write_c_factory(struct mcs_func *f, struct mcs_func_client *c, int offset) {
+    struct mcs_func_req *req = lua_touserdata(f->L, offset + 1);
+    int32_t vlen = 0;
 
     mcs_expand_wbuf(c, REQ_MAX_LENGTH);
 
@@ -1211,16 +1214,27 @@ static int mcslib_write_c_factory(struct mcs_func *f, struct mcs_func_client *c)
     memcpy(p, req->data, req->fac.prefix_len);
     p += req->fac.prefix_len;
 
-    req->fac.numeric = lua_tointeger(f->L, -1);
+    req->fac.numeric = lua_tointeger(f->L, offset + 2);
     if (req->fac.numeric > -1) {
         p = itoa_64(req->fac.numeric, p);
     }
     int klen = p - key;
     req->hash = XXH3_64bits(key, klen);
 
+    if (req->fac.cmd == 's') {
+        vlen = lua_tointeger(f->L, offset + 3);
+        *p = ' ';
+        p++;
+        p = itoa_32(vlen, p);
+    }
+
     // should include the \r\n terminator.
     memcpy(p, req->data + req->fac.prefix_len, req->fac.postfix_len);
     p += req->fac.postfix_len;
+
+    if (req->fac.cmd == 's') {
+        p = _mcs_write_value(req->hash, vlen, p);
+    }
 
     clock_gettime(CLOCK_MONOTONIC, &req->start);
     c->wbuf_used += p - start;
@@ -1268,7 +1282,7 @@ static int mcs_func_lua_yield(struct mcs_func *f, int nresults) {
             res = mcslib_write_c(f, &f->c);
             break;
         case mcs_luayield_write_factory:
-            res = mcslib_write_c_factory(f, &f->c);
+            res = mcslib_write_c_factory(f, &f->c, 0);
             break;
         case mcs_luayield_flush:
             f->c.wbuf_sent = 0;
@@ -1328,7 +1342,7 @@ static int mcs_func_lua_yield(struct mcs_func *f, int nresults) {
             break;
         case mcs_luayield_c_write_factory:
             c = lua_touserdata(f->L, 1);
-            res = mcslib_write_c_factory(f, c);
+            res = mcslib_write_c_factory(f, c, 1);
             break;
         case mcs_luayield_c_flush:
             c = lua_touserdata(f->L, 1);
@@ -1686,9 +1700,11 @@ static int mcslib_add(lua_State *L) {
     frate.period = NSEC_PER_SEC; // default is rate per second.
 
     if (lua_getfield(L, 2, "rate_limit") != LUA_TNIL) {
-        frate.rate = lua_tointeger(L, -1) / threadcount;
-        if (frate.rate == 0) {
+        frate.rate = lua_tointeger(L, -1);
+        if (frate.rate != 0 && frate.rate <= threadcount) {
             frate.rate = 1;
+        } else {
+            frate.rate /= threadcount;
         }
     }
     lua_pop(L, 1);
@@ -2937,6 +2953,10 @@ static int mcslib_ma_factory(lua_State *L) {
     return _mcslib_basic_factory(L, 'a');
 }
 
+static int mcslib_ms_factory(lua_State *L) {
+    return _mcslib_basic_factory(L, 's');
+}
+
 static int mcslib_time_millis(lua_State *L) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -3024,6 +3044,7 @@ static void register_lua_libs(lua_State *L) {
         {"mg_factory", mcslib_mg_factory},
         {"md_factory", mcslib_md_factory},
         {"ma_factory", mcslib_ma_factory},
+        {"ms_factory", mcslib_ms_factory},
         {NULL, NULL}
     };
 
