@@ -1,7 +1,7 @@
 function config(a)
     local t = mcs.thread()
-    --mcs.add_custom(t, { func = "test" }, { opt = "foo" })
-    mcs.add_custom(t, { func = "watch" })
+    mcs.add_custom(t, { func = "test" }, { opt = "foo" })
+    --mcs.add_custom(t, { func = "watch" })
     mcs.shredder({t}, 30)
 end
 
@@ -12,16 +12,18 @@ function test(a)
     -- uses default host/port from commandline if omitted.
     local c = mcs.client_new({ host = "127.0.0.1", port = "11212"})
     mcs.client_connect(c)
+    local res = mcs.res_new()
     while true do
         print("writing get")
         mcs.client_write(c, "get foo\r\n")
         print("calling flush")
         mcs.client_flush(c)
         print("calling read")
-        local res = mcs.client_read(c)
+        mcs.client_read(c, res)
         print("completed read")
         local rline = mcs.resline(res)
         print("read line:", rline)
+        mcs.sleep_millis(250)
     end
 end
 
@@ -33,6 +35,6 @@ function watch(a)
     mcs.client_flush(c)
     while true do
         local rline = mcs.client_readline(c)
-        print("read line:", rline)
+        print("read watch line:", rline)
     end
 end
