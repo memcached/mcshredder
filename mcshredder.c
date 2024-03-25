@@ -3084,6 +3084,7 @@ static int _set_arguments(lua_State *L, const char *arg) {
         }
         lua_settable(L, 1); // -> table
     }
+    free(argcopy);
     return luaL_ref(L, LUA_REGISTRYINDEX);
 }
 
