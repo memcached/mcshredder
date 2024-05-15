@@ -4,7 +4,7 @@
  *
  *       https://github.com/memcached/mcshredder
  *
- *  Copyright 2023 Cache Forge LLC.  All rights reserved.
+ *  Copyright 2024 Cache Forge LLC.  All rights reserved.
  *
  *  Use and distribution licensed under the BSD license.  See
  *  the LICENSE file for full text.
@@ -13,22 +13,8 @@
  *      dormando <dormando@rydia.net>
  */
 
-#include <string.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <ctype.h>
-#include <errno.h>
-#include <pthread.h>
-#include <unistd.h>
-#include <getopt.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <time.h>
+#include "mcshredder.h"
+#include <assert.h>
 
 #include <lua.h>
 #include <lualib.h>
@@ -88,14 +74,6 @@ struct mcs_event {
     queue_cb qcb;
 };
 
-struct mcs_conn {
-    // host info
-    char host[NI_MAXHOST];
-    char port_num[NI_MAXSERV];
-    // event detail
-    int fd;
-};
-
 struct mcs_f_rate {
     int rate;
     uint64_t period; // stored in nanoseconds.
@@ -128,6 +106,11 @@ enum mcs_func_state {
     mcs_fstate_outwait,
     mcs_fstate_sleep,
     mcs_fstate_stop,
+    mcs_fstate_tls_handshake,
+    mcs_fstate_tls_hs_postread,
+    mcs_fstate_tls_hs_postwrite,
+    mcs_fstate_tls_postread,
+    mcs_fstate_tls_write,
 };
 
 enum mcs_lua_yield {
@@ -143,17 +126,6 @@ enum mcs_lua_yield {
     mcs_luayield_c_write,
     mcs_luayield_c_write_factory,
     mcs_luayield_c_flush,
-};
-
-// Should be able to accommodate the rbuf/wbuf used in clients.
-// Not replacing them as of this writing. Should be separate change.
-struct mcs_buf {
-    int used;
-    int sent;
-    int toconsume;
-    size_t size;
-    char *buf;
-    pthread_mutex_t lock;
 };
 
 enum mcs_req_type {
@@ -193,21 +165,6 @@ struct mcs_func_resp {
     char *buf; // start of response buffer
     mcmc_resp_t resp;
     uint16_t tokens[PARSER_MAX_TOKENS]; // offsets for start of each token
-};
-
-// client object for custom funcs
-struct mcs_func_client {
-    struct mcs_conn conn;
-    void *mcmc; // mcmc client object
-    char *wbuf;
-    size_t wbuf_size; // total size of buffer
-    int wbuf_used;
-    int wbuf_sent;
-    char *rbuf;
-    size_t rbuf_size;
-    int rbuf_used;
-    int rbuf_toconsume; // how far to skip rbuf on next read.
-    bool connected;
 };
 
 struct mcs_func {
@@ -272,6 +229,9 @@ struct mcs_ctx {
     thread_head_t threads; // stack of threads
     pthread_cond_t wait_cond; // thread completion signal
     pthread_mutex_t wait_lock;
+#ifdef USE_TLS
+    SSL_CTX *tls_ctx; // global SSL CTX object
+#endif
     struct mcs_buf out_buf; // out/listener stream buffer.
     eventfd_t out_fd;
     uint64_t out_readvar; // let io_uring put eventfd res somewhere.
@@ -542,6 +502,30 @@ static int _evset_wrflush(struct mcs_func *f, struct mcs_func_client *c) {
     return 0;
 }
 
+static int _evset_tls_wrflush(struct mcs_func *f, struct mcs_func_client *c) {
+    struct io_uring_sqe *sqe;
+    struct mcs_tls_client *tc = &c->tls;
+
+    sqe = io_uring_get_sqe(&f->parent->ring);
+    if (sqe == NULL) {
+        return -1;
+    }
+
+    io_uring_prep_write(sqe, mcmc_fd(c->mcmc), tc->wbuf->buf + tc->wbuf->offset,
+        tc->wbuf->used - tc->wbuf->offset, 0);
+    io_uring_sqe_set_data(sqe, &f->ev);
+
+    if (_evset_link_timeout(f) != 0) {
+        io_uring_prep_nop(sqe);
+        io_uring_sqe_set_data(sqe, NULL);
+        sqe->flags = 0;
+
+        return -1;
+    }
+
+    return 0;
+}
+
 static int _evset_read(struct mcs_func *f, struct mcs_func_client *c) {
     struct io_uring_sqe *sqe;
 
@@ -551,6 +535,38 @@ static int _evset_read(struct mcs_func *f, struct mcs_func_client *c) {
     }
 
     io_uring_prep_recv(sqe, mcmc_fd(c->mcmc), c->rbuf + c->rbuf_used, c->rbuf_size - c->rbuf_used, 0);
+    io_uring_sqe_set_data(sqe, &f->ev);
+
+    if (_evset_link_timeout(f) != 0) {
+        io_uring_prep_nop(sqe);
+        io_uring_sqe_set_data(sqe, NULL);
+        sqe->flags = 0;
+
+        return -1;
+    }
+
+    return 0;
+}
+
+static int _evset_tls_read(struct mcs_func *f, struct mcs_func_client *c) {
+    struct io_uring_sqe *sqe;
+    struct mcs_tls_client *tc = &c->tls;
+
+    sqe = io_uring_get_sqe(&f->parent->ring);
+    if (sqe == NULL) {
+        return -1;
+    }
+
+    if (!tc->rbuf) {
+        tc->rbuf = mcs_tls_buf_alloc(RBUF_INITIAL_SIZE);
+        if (!tc->rbuf) {
+            // FIXME: temporary malloc failure? :)
+            return -1;
+        }
+    }
+    // FIXME: if used == size, expand
+    io_uring_prep_recv(sqe, mcmc_fd(c->mcmc), tc->rbuf->buf + tc->rbuf->used,
+            tc->rbuf->size - tc->rbuf->used, 0);
     io_uring_sqe_set_data(sqe, &f->ev);
 
     if (_evset_link_timeout(f) != 0) {
@@ -670,6 +686,38 @@ static int mcs_connect(struct mcs_func_client *c) {
         return -1;
     }
     return 0;
+}
+
+static void mcs_tls_postflush(struct mcs_func *f, struct mcs_func_client *c) {
+    int res = f->cqe_res;
+    struct mcs_tls_client *tc = &c->tls;
+    struct mcs_tls_buf *b = tc->wbuf;
+
+    if (res > 0) {
+        b->offset += res;
+        if (b->offset < b->used) {
+            // need to continue flushing write buffer.
+            f->state = mcs_fstate_flush;
+        } else {
+            free(b);
+            tc->wbuf = NULL;
+            f->state = mcs_fstate_run;
+        }
+    } else if (res < 0) {
+        if (res == -EAGAIN || res == -EWOULDBLOCK) {
+            // TODO: -> wrpoll -> flush
+            // is this even possible with uring?
+            fprintf(stderr, "Unexpectedly could not write to socket: please report this: %d\n", res);
+            abort();
+        } else {
+            f->reserr = res;
+            f->state = mcs_fstate_syserr;
+        }
+    } else if (res == 0) {
+        // disconnected, but probably gracefully
+        f->reserr = 0;
+        f->state = mcs_fstate_syserr;
+    }
 }
 
 void mcs_postflush(struct mcs_func *f, struct mcs_func_client *c) {
@@ -801,6 +849,51 @@ static int mcs_read_buf(struct mcs_func *f, struct mcs_func_client *c) {
     return ret;
 }
 
+static void mcs_tls_postread(struct mcs_func *f, struct mcs_func_client *c) {
+    int res = f->cqe_res;
+    struct mcs_tls_client *tc = &c->tls;
+
+    if (res > 0) {
+        assert(tc->rbuf);
+        tc->rbuf->used += res;
+        // need to decrypt this data into c->rbuf.
+        // then we check mcs_read_buf here against c->rbuf
+        // need to be open to all of the potential TLS weirdness here:
+        // - need to write for some reason.
+        // - need to read more.
+        // - various errors.
+
+        int tres = mcs_tls_enqueue_decrypted(tc);
+        if (tres == MCS_TLS_WANT_IO) {
+            abort();
+        }
+
+        int ret = mcs_read_buf(f, c);
+        if (ret == 0) {
+            f->state = mcs_fstate_run;
+        } else if (ret == 1) {
+            f->state = mcs_fstate_read;
+        } else if (ret < 0) {
+            f->reserr = ret;
+            f->state = mcs_fstate_syserr;
+        }
+    } else if (res < 0) {
+        if (res == -EAGAIN || res == -EWOULDBLOCK) {
+            // TODO: I think we should never get here, as uring is supposed to
+            // only wake us up with data filled.
+            fprintf(stderr, "Unexpectedly could not read from socket, please report this\n");
+            abort();
+        } else {
+            f->reserr = res;
+            f->state = mcs_fstate_syserr;
+        }
+    } else if (res == 0) {
+        // disconnected, but probably gracefully
+        f->reserr = 0;
+        f->state = mcs_fstate_syserr;
+    }
+}
+
 static void mcs_postread(struct mcs_func *f, struct mcs_func_client *c) {
     int res = f->cqe_res;
 
@@ -895,11 +988,58 @@ static void mcs_restart(struct mcs_func *f) {
     }
 }
 
+static void mcs_postread_tls_handshake(struct mcs_func *f, struct mcs_func_client *c) {
+    int res = f->cqe_res;
+    struct mcs_tls_client *tc = &c->tls;
+    struct mcs_tls_buf *rb = tc->rbuf;
+
+    if (res > 0) {
+        rb->used += res;
+        f->state = mcs_fstate_tls_handshake;
+    } else if (res < 0) {
+        f->reserr = res;
+        f->state = mcs_fstate_syserr;
+    } else if (res == 0) {
+        // gracefully disconnected.
+        f->reserr = 0;
+        f->state = mcs_fstate_syserr;
+    }
+}
+
+static int mcs_postwrite_tls_handshake(struct mcs_func *f, struct mcs_func_client *c) {
+    int res = f->cqe_res;
+    struct mcs_tls_client *tc = &c->tls;
+    struct mcs_tls_buf *wb = tc->wbuf;
+
+    if (res > 0) {
+        wb->offset += res;
+        if (wb->offset < wb->used) {
+            // partial write. re-attempt to write.
+            return 0;
+        } else {
+            // TODO: cache routine.
+            // completed send. don't keep the buffer around.
+            free(wb);
+            tc->wbuf = NULL;
+            f->state = mcs_fstate_tls_handshake;
+        }
+    } else if (res < 0) {
+        f->reserr = res;
+        f->state = mcs_fstate_syserr;
+    } else if (res == 0) {
+        f->reserr = 0;
+        f->state = mcs_fstate_syserr;
+    }
+
+    return 1;
+}
+
 // run the function state machine.
 // called _outside_ of the cqe reception loop
 // must return -1 if we tried to allocate an SQE for some reason and couldn't.
 static int mcs_func_run(void *udata) {
     struct mcs_func *f = udata;
+    enum mcs_tls_ret ret;
 
     bool stop = false;
     int err = 0;
@@ -928,8 +1068,13 @@ static int mcs_func_run(void *udata) {
                 f->state = mcs_fstate_retry;
             } else {
                 f->c.connected = true;
-                mcs_start_limiter(f);
-                f->state = mcs_fstate_rerun;
+                // TODO: swap this with a macro that can be zero'ed out.
+                if (f->c.tls.ssl) {
+                    f->state = mcs_fstate_tls_handshake;
+                } else {
+                    mcs_start_limiter(f);
+                    f->state = mcs_fstate_rerun;
+                }
             }
             break;
         case mcs_fstate_run:
@@ -949,23 +1094,59 @@ static int mcs_func_run(void *udata) {
             }
             break;
         case mcs_fstate_flush:
-            if (_evset_wrflush(f, &f->c) == 0) {
-                f->state = mcs_fstate_postflush;
-                stop = true;
+            if (f->c.tls.ssl) {
+                // We need to flush whatever's in wbuf through SSL_write and
+                // then out the socket.
+                int ret = mcs_tls_enqueue_encrypted(&f->c.tls);
+                if (ret == MCS_TLS_OK) {
+                    // write is happy. flush bytes to socket
+                    // if BIO has bytes in it?
+                    if (_evset_tls_wrflush(f, &f->c) == 0) {
+                        f->state = mcs_fstate_postflush;
+                        stop = true;
+                    } else {
+                        return -1;
+                    }
+                } else if (ret == MCS_TLS_WANT_IO) {
+                    // TODO: check if bytes to write or need to read and run
+                    // appropriately.
+                    abort();
+                }
             } else {
-                return -1;
+                if (_evset_wrflush(f, &f->c) == 0) {
+                    f->state = mcs_fstate_postflush;
+                    stop = true;
+                } else {
+                    return -1;
+                }
             }
             break;
         case mcs_fstate_postflush:
-            mcs_postflush(f, &f->c);
+            if (f->c.tls.ssl) {
+                mcs_tls_postflush(f, &f->c);
+            } else {
+                mcs_postflush(f, &f->c);
+            }
             break;
         case mcs_fstate_read:
-            if (_evset_read(f, &f->c) == 0) {
-                f->state = mcs_fstate_postread;
-                stop = true;
+            if (f->c.tls.ssl) {
+                if (_evset_tls_read(f, &f->c) == 0) {
+                    f->state = mcs_fstate_tls_postread;
+                    stop = true;
+                } else {
+                    return -1;
+                }
             } else {
-                return -1;
+                if (_evset_read(f, &f->c) == 0) {
+                    f->state = mcs_fstate_postread;
+                    stop = true;
+                } else {
+                    return -1;
+                }
             }
+            break;
+        case mcs_fstate_tls_postread:
+            mcs_tls_postread(f, &f->c);
             break;
         case mcs_fstate_postread:
             mcs_postread(f, &f->c);
@@ -997,6 +1178,44 @@ static int mcs_func_run(void *udata) {
             f->parent->active_funcs--;
             f->active = false;
             stop = true;
+            break;
+        case mcs_fstate_tls_hs_postread:
+            mcs_postread_tls_handshake(f, &f->c);
+            break;
+        case mcs_fstate_tls_hs_postwrite:
+            if (mcs_postwrite_tls_handshake(f, &f->c) == 0) {
+                // need to continue flushing.
+                if (_evset_tls_wrflush(f, &f->c) != 0) {
+                    // FIXME: double check: is this retrying the whole func
+                    // call? do we need to blank f->cqe_res after reading it
+                    // to stay re-eentrant or is it going to kill the conn?
+                    return -1;
+                }
+                stop = true;
+            }
+            break;
+        case mcs_fstate_tls_handshake:
+            ret = mcs_tls_do_handshake(&f->c.tls);
+            if (ret == MCS_TLS_OK) {
+                f->state = mcs_fstate_rerun;
+            } else if (ret == MCS_TLS_WANT_IO) {
+                if (f->c.tls.wbuf && f->c.tls.wbuf->used) {
+                    if (_evset_tls_wrflush(f, &f->c) != 0) {
+                        return -1;
+                    }
+                    f->state = mcs_fstate_tls_hs_postwrite;
+                } else {
+                    if (_evset_tls_read(f, &f->c) != 0) {
+                        return -1;
+                    }
+                    f->state = mcs_fstate_tls_hs_postread;
+                }
+                stop = true;
+            } else {
+                fprintf(stderr, "ERROR DURING HANDSHAKE\n");
+                abort();
+                // TODO: kill the connection.
+            }
             break;
         default:
             fprintf(stderr, "Unhandled function state, aborting\n");
@@ -1586,7 +1805,12 @@ static struct mcs_func *mcs_add_func(struct mcs_thread *t) {
 
     f->c.rbuf = malloc(RBUF_INITIAL_SIZE);
     f->c.rbuf_size = RBUF_INITIAL_SIZE;
-
+#ifdef USE_TLS
+    if (t->ctx->tls_ctx) {
+        // TODO: check return code
+        mcs_tls_client_init(t->ctx->tls_ctx, &f->c.tls);
+    }
+#endif
     return f;
 }
 
@@ -2116,7 +2340,11 @@ static int mcslib_client_new(lua_State *L) {
 
     c->rbuf = malloc(RBUF_INITIAL_SIZE);
     c->rbuf_size = RBUF_INITIAL_SIZE;
-
+#ifdef USE_TLS
+    if (t->ctx->tls_ctx) {
+        mcs_tls_client_init(t->ctx->tls_ctx, &c->tls);
+    }
+#endif
     // return client object.
     return 1;
 }
@@ -3094,6 +3322,9 @@ static void usage(struct mcs_ctx *ctx) {
            "--port=<port> (11211): Port to connect to\n"
            "--conf=<file> (none): Lua configuration file\n"
            "--arg=<key,key=val,key2=val2> (none): arguments to pass to config script\n"
+#ifdef USE_TLS
+           "--tls: use TLS for talking to memcached\n"
+#endif
            "--memprofile: print allocation statistics once per second\n"
           );
     lua_getglobal(ctx->L, "help");
@@ -3113,6 +3344,7 @@ int main(int argc, char **argv) {
         {"conf", required_argument, 0, 'c'},
         {"arg", required_argument, 0, 'a'},
         {"memprofile", no_argument, 0, 'm'},
+        {"tls", no_argument, 0, 't'},
         {"help", no_argument, 0, 'h'},
         // end
         {0, 0, 0, 0}
@@ -3166,6 +3398,12 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Failed to load config file: %s\n", lua_tostring(L, -1));
                 exit(EXIT_FAILURE);
             }
+            break;
+        case 't':
+#ifdef USE_TLS
+            ctx->tls_ctx = mcs_tls_init();
+            // TODO: err if NULL
+#endif
             break;
         case 'm':
             ctx->memprofile = true;
