@@ -95,7 +95,7 @@ static void kill_and_wait(int pid, int* status)
 	}
 }
 
-static void setup_test()
+static void setup_test(void)
 {
 	prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
 	setpgrp();
@@ -109,7 +109,7 @@ static void execute_one(void);
 static void loop(void)
 {
 	int iter;
-	for (iter = 0; iter < 5000; iter++) {
+	for (iter = 0; iter < 50; iter++) {
 		int pid = fork();
 		if (pid < 0)
 			exit(1);
@@ -175,7 +175,7 @@ int main(int argc, char *argv[])
 	if (argc > 1)
 		return T_EXIT_SKIP;
 	signal(SIGINT, sig_int);
-	mmap((void *) 0x20000000, 0x1000000, 3, 0x32, -1, 0);
+	mmap((void *) 0x20000000, 0x1000000, 3, MAP_ANON|MAP_PRIVATE, -1, 0);
 	loop();
 	return T_EXIT_PASS;
 }

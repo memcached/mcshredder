@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <stdarg.h>
 #include <sys/types.h>
 
 #include <arpa/inet.h>
@@ -35,13 +36,15 @@ void *t_malloc(size_t size)
 int t_bind_ephemeral_port(int fd, struct sockaddr_in *addr)
 {
 	socklen_t addrlen;
+	int ret;
 
 	addr->sin_port = 0;
 	if (bind(fd, (struct sockaddr *)addr, sizeof(*addr)))
 		return -errno;
 
 	addrlen = sizeof(*addr);
-	assert(!getsockname(fd, (struct sockaddr *)addr, &addrlen));
+	ret = getsockname(fd, (struct sockaddr *)addr, &addrlen);
+	assert(!ret);
 	assert(addr->sin_port != 0);
 	return 0;
 }
@@ -134,7 +137,8 @@ enum t_setup_ret t_create_ring_params(int depth, struct io_uring *ring,
 		return T_SETUP_SKIP;
 	}
 
-	fprintf(stderr, "queue_init: %s\n", strerror(-ret));
+	if (ret != -EINVAL)
+		fprintf(stderr, "queue_init: %s\n", strerror(-ret));
 	return ret;
 }
 
@@ -173,7 +177,7 @@ int t_create_socket_pair(int fd[2], bool stream)
 	int val;
 	struct sockaddr_in serv_addr;
 	struct sockaddr *paddr;
-	size_t paddrlen;
+	socklen_t paddrlen;
 
 	type |= SOCK_CLOEXEC;
 	fd[0] = socket(AF_INET, type, 0);
@@ -265,4 +269,50 @@ bool t_probe_defer_taskrun(void)
 		return false;
 	io_uring_queue_exit(&ring);
 	return true;
+}
+
+/*
+ * Sync internal state with kernel ring state on the SQ side. Returns the
+ * number of pending items in the SQ ring, for the shared ring.
+ */
+unsigned __io_uring_flush_sq(struct io_uring *ring)
+{
+	struct io_uring_sq *sq = &ring->sq;
+	unsigned tail = sq->sqe_tail;
+
+	if (sq->sqe_head != tail) {
+		sq->sqe_head = tail;
+		/*
+		 * Ensure kernel sees the SQE updates before the tail update.
+		 */
+		if (!(ring->flags & IORING_SETUP_SQPOLL))
+			*sq->ktail = tail;
+		else
+			io_uring_smp_store_release(sq->ktail, tail);
+	}
+	/*
+	* This load needs to be atomic, since sq->khead is written concurrently
+	* by the kernel, but it doesn't need to be load_acquire, since the
+	* kernel doesn't store to the submission queue; it advances khead just
+	* to indicate that it's finished reading the submission queue entries
+	* so they're available for us to write to.
+	*/
+	return tail - IO_URING_READ_ONCE(*sq->khead);
+}
+
+/*
+ * Implementation of error(3), prints an error message and exits.
+ */
+void t_error(int status, int errnum, const char *format, ...)
+{
+	va_list args;
+    	va_start(args, format);
+
+	vfprintf(stderr, format, args);
+    	if (errnum)
+        	fprintf(stderr, ": %s", strerror(errnum));
+
+	fprintf(stderr, "\n");
+	va_end(args);
+    	exit(status);
 }

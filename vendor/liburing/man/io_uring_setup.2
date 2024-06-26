@@ -13,7 +13,7 @@ io_uring_setup \- setup a context for performing asynchronous I/O
 .PP
 .BI "int io_uring_setup(u32 " entries ", struct io_uring_params *" p );
 .fi
-.PPAA
+.PP
 .SH DESCRIPTION
 .PP
 The
@@ -71,6 +71,14 @@ application must poll for completions on the CQ ring by calling
 It is illegal to mix and match polled and non-polled I/O on an io_uring
 instance.
 
+This is only applicable for storage devices for now, and the storage device
+must be configured for polling. How to do that depends on the device type
+in question. For NVMe devices, the nvme driver must be loaded with the
+.I poll_queues
+parameter set to the desired number of polling queues. The polling queues
+will be shared appropriately between the CPUs in the system, if the number
+is less than the number of online CPU threads.
+
 .TP
 .B IORING_SETUP_SQPOLL
 When this flag is specified, a kernel thread is created to perform
@@ -119,6 +127,18 @@ is a submission queue ring setup using the
 described below.
 .TP
 .BR
+Note that, when using a ring setup with
+.B IORING_SETUP_SQPOLL,
+you never directly call the
+.BR io_uring_enter (2)
+system call. That is usually taken care of by liburing's
+.BR io_uring_submit (3)
+function. It automatically determines if you are using
+polling mode or not and deals with when your program needs to call
+.BR io_uring_enter (2)
+without you having to bother about it.
+.TP
+.BR
 Before version 5.11 of the Linux kernel, to successfully use this feature, the
 application must register a set of files to be used for IO through
 .BR io_uring_register (2)
@@ -132,7 +152,9 @@ feature flag.
 In version 5.11 and later, it is no longer necessary to register files to use
 this feature. 5.11 also allows using this as non-root, if the user has the
 .B CAP_SYS_NICE
-capability.
+capability. In 5.13 this requirement was also relaxed, and no special privileges
+are needed for SQPOLL in newer kernels. Certain stable kernels older than 5.13
+may also support unprivileged SQPOLL.
 .TP
 .B IORING_SETUP_SQ_AFF
 If this flag is specified, then the poll thread will be bound to the
@@ -158,19 +180,19 @@ and may be rounded up to the next power-of-two.
 If this flag is specified, and if
 .IR entries
 exceeds
-.B IORING_MAX_ENTRIES ,
+.BR IORING_MAX_ENTRIES ,
 then
 .IR entries
 will be clamped at
-.B IORING_MAX_ENTRIES .
+.BR IORING_MAX_ENTRIES .
 If the flag
-.BR IORING_SETUP_SQPOLL
+.B IORING_SETUP_CQSIZE
 is set, and if the value of
 .IR "struct io_uring_params.cq_entries"
 exceeds
-.B IORING_MAX_CQ_ENTRIES ,
+.BR IORING_MAX_CQ_ENTRIES ,
 then it will be clamped at
-.B IORING_MAX_CQ_ENTRIES .
+.BR IORING_MAX_CQ_ENTRIES .
 .TP
 .B IORING_SETUP_ATTACH_WQ
 This flag should be set in conjunction with
@@ -188,7 +210,7 @@ See
 for details on how to enable the ring. Available since 5.10.
 .TP
 .B IORING_SETUP_SUBMIT_ALL
-Normally io_uring stops submitting a batch of request, if one of these requests
+Normally io_uring stops submitting a batch of requests, if one of these requests
 results in an error. This can cause submission of less than what is expected,
 if a request ends in error while being submitted. If the ring is created with
 this flag,
@@ -278,6 +300,48 @@ Note that if this flag is set then it is the application's responsibility to per
 trigger work (for example via any of the CQE waiting functions) or else completions may
 not be delivered.
 Available since 6.1.
+.TP
+.B IORING_SETUP_NO_MMAP
+By default, io_uring allocates kernel memory that callers must subsequently
+.BR mmap (2).
+If this flag is set, io_uring instead uses caller-allocated buffers;
+.I p->cq_off.user_addr
+must point to the memory for the sq/cq rings, and
+.I p->sq_off.user_addr
+must point to the memory for the sqes.
+Each allocation must be contiguous memory.
+Typically, callers should allocate this memory by using
+.BR mmap (2)
+to allocate a huge page.
+If this flag is set, a subsequent attempt to
+.BR mmap (2)
+the io_uring file descriptor will fail.
+Available since 6.5.
+.TP
+.B IORING_SETUP_REGISTERED_FD_ONLY
+If this flag is set, io_uring will register the ring file descriptor, and
+return the registered descriptor index, without ever allocating an unregistered
+file descriptor. The caller will need to use
+.B IORING_REGISTER_USE_REGISTERED_RING
+when calling
+.BR io_uring_register (2).
+This flag only makes sense when used alongside with
+.B IORING_SETUP_NO_MMAP,
+which also needs to be set.
+Available since 6.5.
+
+.TP
+.B IORING_SETUP_NO_SQARRAY
+If this flag is set, entries in the submission queue will be submitted in order,
+wrapping around to the first entry after reaching the end of the queue. In other
+words, there will be no more indirection via the array of submission entries,
+and the queue will be indexed directly by the submission queue tail and the
+range of indexed represented by it modulo queue size. Subsequently, the user
+should not map the array of submission queue entries, and the corresponding
+offset in
+.I struct io_sqring_offsets
+will be set to zero. Available since 6.6.
+
 .PP
 If no flags are specified, the io_uring instance is setup for
 interrupt driven I/O.  I/O may be submitted using
@@ -301,10 +365,12 @@ calls down from three to two. Available since kernel 5.4.
 .TP
 .B IORING_FEAT_NODROP
 If this flag is set, io_uring supports almost never dropping completion events.
-If a completion event occurs and the CQ ring is full, the kernel stores
-the event internally until such a time that the CQ ring has room for more
-entries. If this overflow condition is entered, attempting to submit more
-IO will fail with the
+A dropped event can only occur if the kernel runs out of memory, in which case
+you have worse problems than a lost event. Your application and others will
+likely get OOM killed anyway. If a completion event occurs and the CQ ring is
+full, the kernel stores the event internally until such a time that the CQ ring
+has room for more entries. In earlier kernels, if this overflow condition is
+entered, attempting to submit more IO would fail with the
 .B -EBUSY
 error value, if it can't flush the overflown events to the CQ ring. If this
 happens, the application must reap events from the CQ ring and attempt the
@@ -445,6 +511,13 @@ are used with open or accept, then file assignment needs to happen post
 execution of that SQE. If this flag is set, then the kernel will defer
 file assignment until execution of a given request is started. Available since
 kernel 5.17.
+.TP
+.B IORING_FEAT_REG_REG_RING
+If this flag is set, then io_uring supports calling
+.BR io_uring_register (2)
+using a registered ring fd, via
+.BR IORING_REGISTER_USE_REGISTERED_RING .
+Available since kernel 6.3.
 
 .PP
 The rest of the fields in the
@@ -467,7 +540,8 @@ struct io_sqring_offsets {
     __u32 flags;
     __u32 dropped;
     __u32 array;
-    __u32 resv[3];
+    __u32 resv1;
+    __u64 user_addr;
 };
 .EE
 .in
@@ -498,7 +572,7 @@ is the file descriptor returned from
 .BR io_uring_setup (2).
 The addition of
 .I sq_off.array
-to the length of the region accounts for the fact that the ring
+to the length of the region accounts for the fact that the ring is
 located at the end of the data structure.  As an example, the ring
 buffer head pointer can be accessed by adding
 .I sq_off.head
@@ -563,7 +637,8 @@ struct io_cqring_offsets {
     __u32 overflow;
     __u32 cqes;
     __u32 flags;
-    __u32 resv[3];
+    __u32 resv1;
+    __u64 user_addr;
 };
 .EE
 .in
@@ -581,7 +656,9 @@ ptr = mmap(0, cq_off.cqes + cq_entries * sizeof(struct io_uring_cqe),
 .PP
 Closing the file descriptor returned by
 .BR io_uring_setup (2)
-will free all resources associated with the io_uring context.
+will free all resources associated with the io_uring context. Note that this
+may happen asynchronously within the kernel, so it is not guaranteed that
+resources are freed immediately.
 .PP
 .SH RETURN VALUE
 .BR io_uring_setup (2)
@@ -616,6 +693,10 @@ was not, or
 was specified, but
 .I io_uring_params.cq_entries
 was invalid.
+.B IORING_SETUP_REGISTERED_FD_ONLY
+was specified, but
+.B IORING_SETUP_NO_MMAP
+was not.
 .TP
 .B EMFILE
 The per-process limit on the number of open file descriptors has been
@@ -635,6 +716,13 @@ Insufficient kernel resources are available.
 .B IORING_SETUP_SQPOLL
 was specified, but the effective user ID of the caller did not have sufficient
 privileges.
+.TP
+.B EPERM
+.I /proc/sys/kernel/io_uring_disabled
+has the value 2, or it has the value 1 and the calling process does not hold the
+.B CAP_SYS_ADMIN
+capability or is not a member of
+.I /proc/sys/kernel/io_uring_group.
 .SH SEE ALSO
 .BR io_uring_register (2),
 .BR io_uring_enter (2)

@@ -195,7 +195,8 @@ static int start_accept_listen(struct sockaddr_in *addr, int port_off,
 
 	addr->sin_family = AF_INET;
 	addr->sin_addr.s_addr = inet_addr("127.0.0.1");
-	assert(!t_bind_ephemeral_port(fd, addr));
+	ret = t_bind_ephemeral_port(fd, addr);
+	assert(!ret);
 	ret = listen(fd, 128);
 	assert(ret != -1);
 
@@ -272,6 +273,7 @@ static int test_loop(struct io_uring *ring,
 	uint32_t multishot_mask = 0;
 	int nr_fds = multishot ? MAX_FDS : 1;
 	int multishot_idx = multishot ? INITIAL_USER_DATA : 0;
+	int err_ret = T_EXIT_FAIL;
 
 	if (args.overflow)
 		cause_overflow(ring);
@@ -298,6 +300,7 @@ static int test_loop(struct io_uring *ring,
 				no_accept_multi = 1;
 			else
 				no_accept = 1;
+			ret = T_EXIT_SKIP;
 			goto out;
 		} else if (s_fd[i] < 0) {
 			if (args.accept_should_error &&
@@ -307,6 +310,9 @@ static int test_loop(struct io_uring *ring,
 				fixed ? "Fixed" : "",
 				multishot ? "Multishot" : "",
 				i, s_fd[i]);
+			goto err;
+		} else if (s_fd[i] == 195 && args.overflow) {
+			fprintf(stderr, "Broken overflow handling\n");
 			goto err;
 		}
 
@@ -360,10 +366,10 @@ static int test_loop(struct io_uring *ring,
 
 out:
 	close_sock_fds(s_fd, c_fd, nr_fds, fixed);
-	return 0;
+	return T_EXIT_PASS;
 err:
 	close_sock_fds(s_fd, c_fd, nr_fds, fixed);
-	return 1;
+	return err_ret;
 }
 
 static int test(struct io_uring *ring, struct accept_test_args args)
@@ -372,7 +378,7 @@ static int test(struct io_uring *ring, struct accept_test_args args)
 	int ret = 0;
 	int loop;
 	int32_t recv_s0 = start_accept_listen(&addr, 0,
-					      args.nonblock ? O_NONBLOCK : 0);
+					      args.nonblock ? SOCK_NONBLOCK : 0);
 	if (args.queue_accept_before_connect)
 		queue_accept_conn(ring, recv_s0, args);
 	for (loop = 0; loop < 1 + args.extra_loops; loop++) {
@@ -458,7 +464,7 @@ static int test_accept_many(struct test_accept_many_args args)
 
 	for (i = 0; i < nr_socks; i++)
 		fds[i] = start_accept_listen(NULL, i,
-					     args.nonblock ? O_NONBLOCK : 0);
+					     args.nonblock ? SOCK_NONBLOCK : 0);
 
 	for (i = 0; i < nr; i++) {
 		int sock_idx = args.single_sock ? 0 : i;
@@ -552,6 +558,9 @@ static int test_accept_cancel(unsigned usecs, unsigned int nr, bool multishot)
 			fprintf(stderr, "unexpected 0 user data\n");
 			goto err;
 		} else if (cqe->user_data <= nr) {
+			/* no multishot */
+			if (cqe->res == -EINVAL)
+				return T_EXIT_SKIP;
 			if (cqe->res != -EINTR && cqe->res != -ECANCELED) {
 				fprintf(stderr, "Cancelled accept got %d\n", cqe->res);
 				goto err;
@@ -611,7 +620,7 @@ static int test_multishot_accept(int count, bool before, bool overflow)
 	return ret;
 }
 
-static int test_accept_multishot_wrong_arg()
+static int test_accept_multishot_wrong_arg(void)
 {
 	struct io_uring m_io_uring;
 	struct io_uring_cqe *cqe;
@@ -676,7 +685,12 @@ static int test_accept_fixed(void)
 	ret = io_uring_queue_init(32, &m_io_uring, 0);
 	assert(ret >= 0);
 	ret = io_uring_register_files(&m_io_uring, &fd, 1);
-	assert(ret == 0);
+	if (ret) {
+		/* kernel doesn't support sparse registered files, skip */
+		if (ret == -EBADF || ret == -EINVAL)
+			return T_EXIT_SKIP;
+		return T_EXIT_FAIL;
+	}
 	ret = test(&m_io_uring, args);
 	io_uring_queue_exit(&m_io_uring);
 	return ret;
@@ -698,7 +712,12 @@ static int test_multishot_fixed_accept(void)
 	ret = io_uring_queue_init(MAX_FDS + 10, &m_io_uring, 0);
 	assert(ret >= 0);
 	ret = io_uring_register_files(&m_io_uring, fd, MAX_FDS);
-	assert(ret == 0);
+	if (ret) {
+		/* kernel doesn't support sparse registered files, skip */
+		if (ret == -EBADF || ret == -EINVAL)
+			return T_EXIT_SKIP;
+		return T_EXIT_FAIL;
+	}
 	ret = test(&m_io_uring, args);
 	io_uring_queue_exit(&m_io_uring);
 	return ret;
@@ -733,8 +752,9 @@ int main(int argc, char *argv[])
 
 	if (argc > 1)
 		return T_EXIT_SKIP;
+
 	ret = test_accept(1, false);
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_accept failed\n");
 		return ret;
 	}
@@ -742,141 +762,141 @@ int main(int argc, char *argv[])
 		return T_EXIT_SKIP;
 
 	ret = test_accept(2, false);
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_accept(2) failed\n");
 		return ret;
 	}
 
 	ret = test_accept(2, true);
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_accept(2, true) failed\n");
 		return ret;
 	}
 
 	ret = test_accept_nonblock(false, 1);
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_accept_nonblock failed\n");
 		return ret;
 	}
 
 	ret = test_accept_nonblock(true, 1);
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_accept_nonblock(before, 1) failed\n");
 		return ret;
 	}
 
 	ret = test_accept_nonblock(true, 3);
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_accept_nonblock(before,3) failed\n");
 		return ret;
 	}
 
 	ret = test_accept_fixed();
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_accept_fixed failed\n");
 		return ret;
 	}
 
 	ret = test_multishot_fixed_accept();
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_multishot_fixed_accept failed\n");
 		return ret;
 	}
 
 	ret = test_accept_multishot_wrong_arg();
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_accept_multishot_wrong_arg failed\n");
 		return ret;
 	}
 
 	ret = test_accept_sqpoll();
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_accept_sqpoll failed\n");
 		return ret;
 	}
 
 	ret = test_accept_cancel(0, 1, false);
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_accept_cancel nodelay failed\n");
 		return ret;
 	}
 
 	ret = test_accept_cancel(10000, 1, false);
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_accept_cancel delay failed\n");
 		return ret;
 	}
 
 	ret = test_accept_cancel(0, 4, false);
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_accept_cancel nodelay failed\n");
 		return ret;
 	}
 
 	ret = test_accept_cancel(10000, 4, false);
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_accept_cancel delay failed\n");
 		return ret;
 	}
 
 	ret = test_accept_cancel(0, 1, true);
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_accept_cancel multishot nodelay failed\n");
 		return ret;
 	}
 
 	ret = test_accept_cancel(10000, 1, true);
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_accept_cancel multishot delay failed\n");
 		return ret;
 	}
 
 	ret = test_accept_cancel(0, 4, true);
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_accept_cancel multishot nodelay failed\n");
 		return ret;
 	}
 
 	ret = test_accept_cancel(10000, 4, true);
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_accept_cancel multishot delay failed\n");
 		return ret;
 	}
 
 	ret = test_multishot_accept(1, true, true);
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_multishot_accept(1, false, true) failed\n");
 		return ret;
 	}
 
 	ret = test_multishot_accept(1, false, false);
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_multishot_accept(1, false, false) failed\n");
 		return ret;
 	}
 
 	ret = test_multishot_accept(1, true, false);
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_multishot_accept(1, true, false) failed\n");
 		return ret;
 	}
 
 	ret = test_accept_many((struct test_accept_many_args) {});
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_accept_many failed\n");
 		return ret;
 	}
 
 	ret = test_accept_many((struct test_accept_many_args) {
 				.usecs = 100000 });
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_accept_many(sleep) failed\n");
 		return ret;
 	}
 
 	ret = test_accept_many((struct test_accept_many_args) {
 				.nonblock = true });
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_accept_many(nonblock) failed\n");
 		return ret;
 	}
@@ -885,13 +905,13 @@ int main(int argc, char *argv[])
 				.nonblock = true,
 				.single_sock = true,
 				.close_fds = true });
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_accept_many(nonblock,close) failed\n");
 		return ret;
 	}
 
 	ret = test_accept_pending_on_exit();
-	if (ret) {
+	if (ret == T_EXIT_FAIL) {
 		fprintf(stderr, "test_accept_pending_on_exit failed\n");
 		return ret;
 	}
