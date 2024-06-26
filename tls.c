@@ -238,6 +238,7 @@ int mcs_tls_enqueue_encrypted(struct mcs_tls_client *c) {
             err == SSL_ERROR_WANT_READ) {
             return MCS_TLS_WANT_IO;
         }
+        // FIXME: return error.
     } else {
         // SSL_write() should technically keep retrying, using the same input
         // arguments, until it "succeeds". Lets warn here to see if we ever
