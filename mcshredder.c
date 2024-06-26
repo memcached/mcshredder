@@ -46,6 +46,9 @@
 
 #define PRING_QUEUE_SQ_ENTRIES 1024
 #define PRING_QUEUE_CQ_ENTRIES 4096
+// min available SQE's before we run a callback.
+// means this is the max number of SQE's a callback can safely fetch.
+#define PRING_MIN_SQE 4
 // avoiding some hacks for finding member size.
 #define SOCK_MAX 100
 
@@ -433,9 +436,6 @@ static int _evset_link_timeout(struct mcs_func *f) {
     struct io_uring_sqe *sqe;
 
     sqe = io_uring_get_sqe(&f->parent->ring);
-    if (sqe == NULL) {
-        return -1;
-    }
     io_uring_prep_link_timeout(sqe, &timeout_default, 0);
     io_uring_sqe_set_data(sqe, NULL);
 
@@ -446,9 +446,6 @@ static int _evset_abs_timeout(struct mcs_func *f) {
     struct io_uring_sqe *sqe;
 
     sqe = io_uring_get_sqe(&f->parent->ring);
-    if (sqe == NULL) {
-        return -1;
-    }
     io_uring_prep_timeout(sqe, &f->rate.next, 0, IORING_TIMEOUT_ABS);
     io_uring_sqe_set_data(sqe, &f->ev);
 
@@ -459,9 +456,6 @@ static int _evset_retry_timeout(struct mcs_func *f) {
     struct io_uring_sqe *sqe;
 
     sqe = io_uring_get_sqe(&f->parent->ring);
-    if (sqe == NULL) {
-        return -1;
-    }
     io_uring_prep_timeout(sqe, &timeout_retry, 0, 0);
     io_uring_sqe_set_data(sqe, &f->ev);
 
@@ -472,9 +466,6 @@ static int _evset_sleep(struct mcs_func *f) {
     struct io_uring_sqe *sqe;
 
     sqe = io_uring_get_sqe(&f->parent->ring);
-    if (sqe == NULL) {
-        return -1;
-    }
     io_uring_prep_timeout(sqe, &f->tosleep, 0, 0);
     io_uring_sqe_set_data(sqe, &f->ev);
 
@@ -485,24 +476,13 @@ static int _evset_wrpoll(struct mcs_func *f, struct mcs_func_client *c) {
     struct io_uring_sqe *sqe;
 
     sqe = io_uring_get_sqe(&f->parent->ring);
-    if (sqe == NULL) {
-        return -1;
-    }
 
     io_uring_prep_poll_add(sqe, mcmc_fd(c->mcmc), POLLOUT);
     io_uring_sqe_set_data(sqe, &f->ev);
 
     sqe->flags |= IOSQE_IO_LINK;
 
-    // couldn't link our timeout, need to give up on this sqe.
-    // should be an extremely rare event.
-    if (_evset_link_timeout(f) != 0) {
-        io_uring_prep_nop(sqe);
-        io_uring_sqe_set_data(sqe, NULL);
-        sqe->flags = 0;
-
-        return -1;
-    }
+    _evset_link_timeout(f);
 
     return 0;
 }
@@ -511,9 +491,6 @@ static int _evset_nop(struct mcs_func *f) {
     struct io_uring_sqe *sqe;
 
     sqe = io_uring_get_sqe(&f->parent->ring);
-    if (sqe == NULL) {
-        return -1;
-    }
     io_uring_prep_nop(sqe);
     io_uring_sqe_set_data(sqe, &f->ev);
 
@@ -524,20 +501,11 @@ static int _evset_wrflush(struct mcs_func *f, struct mcs_func_client *c) {
     struct io_uring_sqe *sqe;
 
     sqe = io_uring_get_sqe(&f->parent->ring);
-    if (sqe == NULL) {
-        return -1;
-    }
 
     io_uring_prep_write(sqe, mcmc_fd(c->mcmc), c->wbuf + c->wbuf_sent, c->wbuf_used - c->wbuf_sent, 0);
     io_uring_sqe_set_data(sqe, &f->ev);
 
-    if (_evset_link_timeout(f) != 0) {
-        io_uring_prep_nop(sqe);
-        io_uring_sqe_set_data(sqe, NULL);
-        sqe->flags = 0;
-
-        return -1;
-    }
+    _evset_link_timeout(f);
 
     return 0;
 }
@@ -546,20 +514,11 @@ static int _evset_read(struct mcs_func *f, struct mcs_func_client *c) {
     struct io_uring_sqe *sqe;
 
     sqe = io_uring_get_sqe(&f->parent->ring);
-    if (sqe == NULL) {
-        return -1;
-    }
 
     io_uring_prep_recv(sqe, mcmc_fd(c->mcmc), c->rbuf + c->rbuf_used, c->rbuf_size - c->rbuf_used, 0);
     io_uring_sqe_set_data(sqe, &f->ev);
 
-    if (_evset_link_timeout(f) != 0) {
-        io_uring_prep_nop(sqe);
-        io_uring_sqe_set_data(sqe, NULL);
-        sqe->flags = 0;
-
-        return -1;
-    }
+    _evset_link_timeout(f);
 
     return 0;
 }
@@ -569,9 +528,6 @@ static int _evset_read_eventfd(struct mcs_func *f) {
     struct mcs_ctx *ctx = f->parent->ctx;
 
     sqe = io_uring_get_sqe(&f->parent->ring);
-    if (sqe == NULL) {
-        return -1;
-    }
 
     io_uring_prep_read(sqe, ctx->out_fd, &ctx->out_readvar, sizeof(uint64_t), 0);
     io_uring_sqe_set_data(sqe, &f->ev);
@@ -585,9 +541,6 @@ static int _evset_cancel(struct mcs_func *f) {
     struct io_uring_sqe *sqe;
 
     sqe = io_uring_get_sqe(&f->parent->ring);
-    if (sqe == NULL) {
-        return -1;
-    }
 
     io_uring_prep_cancel(sqe, &f->ev, 0);
     io_uring_sqe_set_data(sqe, &f->ev);
@@ -834,12 +787,9 @@ static void mcs_postread(struct mcs_func *f, struct mcs_func_client *c) {
 
 static int mcs_reschedule(struct mcs_func *f) {
     if (f->rate.rate != 0) {
-        if (_evset_abs_timeout(f) == 0) {
-            // schedule the next wakeup time.
-            timespec_add(&f->rate.next, &f->rate.delta);
-        } else {
-            return -1;
-        }
+        _evset_abs_timeout(f);
+        // schedule the next wakeup time.
+        timespec_add(&f->rate.next, &f->rate.delta);
     } else {
         return _evset_nop(f);
     }
@@ -915,9 +865,7 @@ static int mcs_func_run(void *udata) {
             }
             break;
         case mcs_fstate_connecting:
-            if (_evset_wrpoll(f, &f->c) != 0) {
-                return -1;
-            }
+            _evset_wrpoll(f, &f->c);
             f->state = mcs_fstate_postconnect;
             stop = true;
             break;
@@ -949,34 +897,25 @@ static int mcs_func_run(void *udata) {
             }
             break;
         case mcs_fstate_flush:
-            if (_evset_wrflush(f, &f->c) == 0) {
-                f->state = mcs_fstate_postflush;
-                stop = true;
-            } else {
-                return -1;
-            }
+            _evset_wrflush(f, &f->c);
+            f->state = mcs_fstate_postflush;
+            stop = true;
             break;
         case mcs_fstate_postflush:
             mcs_postflush(f, &f->c);
             break;
         case mcs_fstate_read:
-            if (_evset_read(f, &f->c) == 0) {
-                f->state = mcs_fstate_postread;
-                stop = true;
-            } else {
-                return -1;
-            }
+            _evset_read(f, &f->c);
+            f->state = mcs_fstate_postread;
+            stop = true;
             break;
         case mcs_fstate_postread:
             mcs_postread(f, &f->c);
             break;
         case mcs_fstate_retry:
-            if (_evset_retry_timeout(f) == 0) {
-                f->state = mcs_fstate_postretry;
-                stop = true;
-            } else {
-                return -1;
-            }
+            _evset_retry_timeout(f);
+            f->state = mcs_fstate_postretry;
+            stop = true;
             break;
         case mcs_fstate_postretry:
             // FIXME: go directly to disconn from retry?
@@ -986,12 +925,9 @@ static int mcs_func_run(void *udata) {
             mcs_syserror(f);
             break;
         case mcs_fstate_sleep:
-            if (_evset_sleep(f) == 0) {
-                f->state = mcs_fstate_run;
-                stop = true;
-            } else {
-                return -1;
-            }
+            _evset_sleep(f);
+            f->state = mcs_fstate_run;
+            stop = true;
             break;
         case mcs_fstate_stop:
             f->parent->active_funcs--;
@@ -1017,9 +953,7 @@ static int mcs_cfunc_run(void *udata) {
     switch (f->state) {
         case mcs_fstate_connecting:
             c = lua_touserdata(f->L, 1);
-            if (_evset_wrpoll(f, c) != 0) {
-                return -1;
-            }
+            _evset_wrpoll(f, c);
             f->state = mcs_fstate_postconnect;
             stop = true;
             break;
@@ -1045,11 +979,10 @@ static int mcs_cfunc_run(void *udata) {
                 lua_pushinteger(f->L, -1);
                 f->lua_nargs = 2;
                 f->state = mcs_fstate_run;
-            } else if (_evset_read(f, c) == 0) {
+            } else {
+                _evset_read(f, c);
                 f->state = mcs_fstate_postread;
                 stop = true;
-            } else {
-                return -1;
             }
             break;
         case mcs_fstate_postread:
@@ -1063,11 +996,10 @@ static int mcs_cfunc_run(void *udata) {
                 lua_pushinteger(f->L, 0);
                 f->lua_nargs = 2;
                 f->state = mcs_fstate_run;
-            } else if (_evset_wrflush(f, c) == 0) {
+            } else {
+                _evset_wrflush(f, c);
                 f->state = mcs_fstate_postflush;
                 stop = true;
-            } else {
-                return -1;
             }
             break;
         case mcs_fstate_postflush:
@@ -1090,10 +1022,9 @@ static int mcs_cfunc_run(void *udata) {
             // read that much per wake event.
             if (mcs_buf_used(&f->parent->ctx->out_buf) != 0) {
                 f->state = mcs_fstate_run;
-            } else if (_evset_read_eventfd(f) == 0) {
-                stop = true;
             } else {
-                return -1;
+                _evset_read_eventfd(f);
+                stop = true;
             }
             break;
         case mcs_fstate_run:
@@ -1102,12 +1033,9 @@ static int mcs_cfunc_run(void *udata) {
             }
             break;
         case mcs_fstate_sleep:
-            if (_evset_sleep(f) == 0) {
-                f->state = mcs_fstate_run;
-                stop = true;
-            } else {
-                return -1;
-            }
+            _evset_sleep(f);
+            f->state = mcs_fstate_run;
+            stop = true;
             break;
         case mcs_fstate_stop:
             f->parent->active_funcs--;
@@ -1476,13 +1404,14 @@ static void *shredder_thread(void *arg) {
         STAILQ_CONCAT(&fhead, &t->func_runlist);
 
         // call queue any queue callbacks
-        while (!STAILQ_EMPTY(&fhead)) {
+        while (!STAILQ_EMPTY(&fhead)
+                && io_uring_sq_space_left(&t->ring) > PRING_MIN_SQE) {
             struct mcs_func *f = STAILQ_FIRST(&fhead);
             STAILQ_REMOVE_HEAD(&fhead, next_run);
             f->linked = false;
             int res = f->ev.qcb(f);
             if (res == -1) {
-                // failed to get SQE's, need to continue the list later.
+                // temporary failure, need to continue the list later.
                 STAILQ_INSERT_HEAD(&t->func_runlist, f, next_run);
                 break;
             }
@@ -1502,6 +1431,10 @@ static void *shredder_thread(void *arg) {
             STAILQ_FOREACH(f, &t->func_list, next_func) {
                 if (f->active) {
                     f->ev.cb = mcs_close_cb;
+                    // have to try again later.
+                    if (io_uring_sq_space_left(&t->ring) < PRING_MIN_SQE) {
+                        break;
+                    }
                     _evset_cancel(f);
                 }
             }
