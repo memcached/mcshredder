@@ -432,47 +432,39 @@ static void init_thread_uring(struct mcs_thread *t) {
 // NOTE: Don't believe we need handlers on timeouts, as the linked SQE will
 // return with an abort failure.
 // TODO: timeout override.
-static int _evset_link_timeout(struct mcs_func *f) {
+static void _evset_link_timeout(struct mcs_func *f) {
     struct io_uring_sqe *sqe;
 
     sqe = io_uring_get_sqe(&f->parent->ring);
     io_uring_prep_link_timeout(sqe, &timeout_default, 0);
     io_uring_sqe_set_data(sqe, NULL);
-
-    return 0;
 }
 
-static int _evset_abs_timeout(struct mcs_func *f) {
+static void _evset_abs_timeout(struct mcs_func *f) {
     struct io_uring_sqe *sqe;
 
     sqe = io_uring_get_sqe(&f->parent->ring);
     io_uring_prep_timeout(sqe, &f->rate.next, 0, IORING_TIMEOUT_ABS);
     io_uring_sqe_set_data(sqe, &f->ev);
-
-    return 0;
 }
 
-static int _evset_retry_timeout(struct mcs_func *f) {
+static void _evset_retry_timeout(struct mcs_func *f) {
     struct io_uring_sqe *sqe;
 
     sqe = io_uring_get_sqe(&f->parent->ring);
     io_uring_prep_timeout(sqe, &timeout_retry, 0, 0);
     io_uring_sqe_set_data(sqe, &f->ev);
-
-    return 0;
 }
 
-static int _evset_sleep(struct mcs_func *f) {
+static void _evset_sleep(struct mcs_func *f) {
     struct io_uring_sqe *sqe;
 
     sqe = io_uring_get_sqe(&f->parent->ring);
     io_uring_prep_timeout(sqe, &f->tosleep, 0, 0);
     io_uring_sqe_set_data(sqe, &f->ev);
-
-    return 0;
 }
 
-static int _evset_wrpoll(struct mcs_func *f, struct mcs_func_client *c) {
+static void _evset_wrpoll(struct mcs_func *f, struct mcs_func_client *c) {
     struct io_uring_sqe *sqe;
 
     sqe = io_uring_get_sqe(&f->parent->ring);
@@ -483,21 +475,17 @@ static int _evset_wrpoll(struct mcs_func *f, struct mcs_func_client *c) {
     sqe->flags |= IOSQE_IO_LINK;
 
     _evset_link_timeout(f);
-
-    return 0;
 }
 
-static int _evset_nop(struct mcs_func *f) {
+static void _evset_nop(struct mcs_func *f) {
     struct io_uring_sqe *sqe;
 
     sqe = io_uring_get_sqe(&f->parent->ring);
     io_uring_prep_nop(sqe);
     io_uring_sqe_set_data(sqe, &f->ev);
-
-    return 0;
 }
 
-static int _evset_wrflush(struct mcs_func *f, struct mcs_func_client *c) {
+static void _evset_wrflush(struct mcs_func *f, struct mcs_func_client *c) {
     struct io_uring_sqe *sqe;
 
     sqe = io_uring_get_sqe(&f->parent->ring);
@@ -506,11 +494,9 @@ static int _evset_wrflush(struct mcs_func *f, struct mcs_func_client *c) {
     io_uring_sqe_set_data(sqe, &f->ev);
 
     _evset_link_timeout(f);
-
-    return 0;
 }
 
-static int _evset_read(struct mcs_func *f, struct mcs_func_client *c) {
+static void _evset_read(struct mcs_func *f, struct mcs_func_client *c) {
     struct io_uring_sqe *sqe;
 
     sqe = io_uring_get_sqe(&f->parent->ring);
@@ -519,11 +505,9 @@ static int _evset_read(struct mcs_func *f, struct mcs_func_client *c) {
     io_uring_sqe_set_data(sqe, &f->ev);
 
     _evset_link_timeout(f);
-
-    return 0;
 }
 
-static int _evset_read_eventfd(struct mcs_func *f) {
+static void _evset_read_eventfd(struct mcs_func *f) {
     struct io_uring_sqe *sqe;
     struct mcs_ctx *ctx = f->parent->ctx;
 
@@ -533,19 +517,15 @@ static int _evset_read_eventfd(struct mcs_func *f) {
     io_uring_sqe_set_data(sqe, &f->ev);
 
     // no timeout; block forever.
-
-    return 0;
 }
 
-static int _evset_cancel(struct mcs_func *f) {
+static void _evset_cancel(struct mcs_func *f) {
     struct io_uring_sqe *sqe;
 
     sqe = io_uring_get_sqe(&f->parent->ring);
 
     io_uring_prep_cancel(sqe, &f->ev, 0);
     io_uring_sqe_set_data(sqe, &f->ev);
-
-    return 0;
 }
 
 // *** CORE ***
@@ -785,15 +765,14 @@ static void mcs_postread(struct mcs_func *f, struct mcs_func_client *c) {
     }
 }
 
-static int mcs_reschedule(struct mcs_func *f) {
+static void mcs_reschedule(struct mcs_func *f) {
     if (f->rate.rate != 0) {
         _evset_abs_timeout(f);
         // schedule the next wakeup time.
         timespec_add(&f->rate.next, &f->rate.delta);
     } else {
-        return _evset_nop(f);
+        _evset_nop(f);
     }
-    return 0;
 }
 
 static void mcs_syserror(struct mcs_func *f) {
@@ -889,12 +868,9 @@ static int mcs_func_run(void *udata) {
             mcs_restart(f);
             break;
         case mcs_fstate_rerun:
-            if (mcs_reschedule(f) == 0) {
-                f->state = mcs_fstate_restart;
-                stop = true;
-            } else {
-                return -1;
-            }
+            mcs_reschedule(f);
+            f->state = mcs_fstate_restart;
+            stop = true;
             break;
         case mcs_fstate_flush:
             _evset_wrflush(f, &f->c);
