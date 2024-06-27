@@ -38,6 +38,7 @@
 #include <liburing.h>
 #include <poll.h> // POLLOUT for liburing.
 
+#include "mcshredder.h"
 #include "vendor/mcmc/mcmc.h"
 #include "queue.h"
 #include "itoa_ljust.h"
@@ -91,14 +92,6 @@ struct mcs_event {
     queue_cb qcb;
 };
 
-struct mcs_conn {
-    // host info
-    char host[NI_MAXHOST];
-    char port_num[NI_MAXSERV];
-    // event detail
-    int fd;
-};
-
 struct mcs_f_rate {
     int rate;
     uint64_t period; // stored in nanoseconds.
@@ -148,17 +141,6 @@ enum mcs_lua_yield {
     mcs_luayield_c_flush,
 };
 
-// Should be able to accommodate the rbuf/wbuf used in clients.
-// Not replacing them as of this writing. Should be separate change.
-struct mcs_buf {
-    int used;
-    int sent;
-    int toconsume;
-    size_t size;
-    char *buf;
-    pthread_mutex_t lock;
-};
-
 enum mcs_req_type {
     mcs_req_type_flat = 0,
     mcs_req_type_factory = 1,
@@ -196,21 +178,6 @@ struct mcs_func_resp {
     char *buf; // start of response buffer
     mcmc_resp_t resp;
     uint16_t tokens[PARSER_MAX_TOKENS]; // offsets for start of each token
-};
-
-// client object for custom funcs
-struct mcs_func_client {
-    struct mcs_conn conn;
-    void *mcmc; // mcmc client object
-    char *wbuf;
-    size_t wbuf_size; // total size of buffer
-    int wbuf_used;
-    int wbuf_sent;
-    char *rbuf;
-    size_t rbuf_size;
-    int rbuf_used;
-    int rbuf_toconsume; // how far to skip rbuf on next read.
-    bool connected;
 };
 
 struct mcs_func {
@@ -275,7 +242,7 @@ struct mcs_ctx {
     thread_head_t threads; // stack of threads
     pthread_cond_t wait_cond; // thread completion signal
     pthread_mutex_t wait_lock;
-    struct mcs_buf out_buf; // out/listener stream buffer.
+    struct mcs_lock_buf out_buf; // out/listener stream buffer.
     eventfd_t out_fd;
     uint64_t out_readvar; // let io_uring put eventfd res somewhere.
     bool memprofile; // runs threads with a memory profiler.
@@ -530,10 +497,10 @@ static void _evset_cancel(struct mcs_func *f) {
 
 // *** CORE ***
 
-static int mcs_buf_used(struct mcs_buf *b) {
+static int mcs_lock_buf_used(struct mcs_lock_buf *b) {
     int used = 0;
     pthread_mutex_lock(&b->lock);
-    used = b->used;
+    used = b->buf.used;
     pthread_mutex_unlock(&b->lock);
     return used;
 }
@@ -549,12 +516,12 @@ static void mcs_check_buf(struct mcs_buf *b, size_t len) {
     while (b->used + len > b->size) {
         b->size += BUF_INITIAL_SIZE;
     }
-    char *nb = realloc(b->buf, b->size);
+    char *nb = realloc(b->data, b->size);
     if (nb == NULL) {
         fprintf(stderr, "Failed to realloc buffer buffer\n");
         abort();
     }
-    b->buf = nb;
+    b->data = nb;
 }
 
 static void mcs_expand_rbuf(struct mcs_func_client *c) {
@@ -996,7 +963,7 @@ static int mcs_cfunc_run(void *udata) {
             // things will keep putting data on the out buffer.
             // might need to write the total bytes into the eventfd and then
             // read that much per wake event.
-            if (mcs_buf_used(&f->parent->ctx->out_buf) != 0) {
+            if (mcs_lock_buf_used(&f->parent->ctx->out_buf) != 0) {
                 f->state = mcs_fstate_run;
             } else {
                 _evset_read_eventfd(f);
@@ -1212,7 +1179,7 @@ static int mcs_func_lua_yield(struct mcs_func *f, int nresults) {
             f->state = mcs_fstate_sleep;
             break;
         case mcs_luayield_outwait:
-            if (mcs_buf_used(&f->parent->ctx->out_buf) != 0) {
+            if (mcs_lock_buf_used(&f->parent->ctx->out_buf) != 0) {
                 f->state = mcs_fstate_run;
             } else {
                 f->state = mcs_fstate_outwait;
@@ -2136,7 +2103,7 @@ static int mcslib_out_wait(lua_State *L) {
 static int mcslib_out(lua_State *L) {
     struct mcs_thread *t = *(struct mcs_thread **)lua_getextraspace(L);
     struct mcs_ctx *ctx = t->ctx;
-    struct mcs_buf *ob = &ctx->out_buf;
+    struct mcs_lock_buf *ob = &ctx->out_buf;
     int argc = lua_gettop(L);
     size_t sizes[OUT_MAXLINES];
     const char *lines[OUT_MAXLINES];
@@ -2177,8 +2144,8 @@ static int mcslib_out(lua_State *L) {
     }
 
     pthread_mutex_lock(&ctx->out_buf.lock);
-    mcs_check_buf(ob, newlen);
-    char *p = ob->buf + ob->used;
+    mcs_check_buf(&ob->buf, newlen);
+    char *p = ob->buf.data + ob->buf.used;
     char *start = p;
     bool more = false;
 
@@ -2202,7 +2169,7 @@ static int mcslib_out(lua_State *L) {
         p++;
     }
 
-    ob->used += p - start;
+    ob->buf.used += p - start;
 
     // notify.
     uint64_t u = 1;
@@ -2223,22 +2190,23 @@ static int mcslib_out(lua_State *L) {
 static int mcslib_out_readline(lua_State *L) {
     struct mcs_thread *t = *(struct mcs_thread **)lua_getextraspace(L);
     struct mcs_ctx *ctx = t->ctx;
-    struct mcs_buf *ob = &ctx->out_buf;
+    struct mcs_lock_buf *lb = &ctx->out_buf;
 
     // Technically a bit sketchy since we call lua with the lock held, but I
     // doubt this will fail in practice.
     // A potential fix is to lock twice: once to find the end string and again
     // to memmove afterward... but if we have multiple readers this will break
     // too.
-    pthread_mutex_lock(&ob->lock);
+    pthread_mutex_lock(&lb->lock);
+    struct mcs_buf *ob = &lb->buf;
     if (ob->used > 0) {
-        char *end = memchr(ob->buf, '\n', ob->used);
+        char *end = memchr(ob->data, '\n', ob->used);
         if (end != NULL) {
-            size_t len = end - ob->buf;
-            lua_pushlstring(L, ob->buf, len); // strip the \n
+            size_t len = end - ob->data;
+            lua_pushlstring(L, ob->data, len); // strip the \n
             ob->used -= len+1; // but remember to skip it.
             if (ob->used) {
-                memmove(ob->buf, ob->buf+len+1, ob->used);
+                memmove(ob->data, ob->data+len+1, ob->used);
             }
         } else {
             lua_pushnil(L);
@@ -2246,7 +2214,7 @@ static int mcslib_out_readline(lua_State *L) {
     } else {
         lua_pushnil(L);
     }
-    pthread_mutex_unlock(&ob->lock);
+    pthread_mutex_unlock(&lb->lock);
 
     return 1;
 }
@@ -3043,8 +3011,8 @@ int main(int argc, char **argv) {
         perror("failed to create notify eventfd");
         exit(EXIT_FAILURE);
     }
-    ctx->out_buf.buf = malloc(BUF_INITIAL_SIZE);
-    ctx->out_buf.size = BUF_INITIAL_SIZE;
+    ctx->out_buf.buf.data = malloc(BUF_INITIAL_SIZE);
+    ctx->out_buf.buf.size = BUF_INITIAL_SIZE;
 
     // - create main VM
     lua_State *L = luaL_newstate();
