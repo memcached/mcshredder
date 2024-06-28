@@ -457,7 +457,7 @@ static void _evset_wrflush(struct mcs_func *f, struct mcs_func_client *c) {
 
     sqe = io_uring_get_sqe(&f->parent->ring);
 
-    io_uring_prep_write(sqe, mcmc_fd(c->mcmc), c->wbuf + c->wbuf_sent, c->wbuf_used - c->wbuf_sent, 0);
+    io_uring_prep_write(sqe, mcmc_fd(c->mcmc), c->wb.data + c->wb.offset, c->wb.used - c->wb.offset, 0);
     io_uring_sqe_set_data(sqe, &f->ev);
 
     _evset_link_timeout(f);
@@ -468,7 +468,7 @@ static void _evset_read(struct mcs_func *f, struct mcs_func_client *c) {
 
     sqe = io_uring_get_sqe(&f->parent->ring);
 
-    io_uring_prep_recv(sqe, mcmc_fd(c->mcmc), c->rbuf + c->rbuf_used, c->rbuf_size - c->rbuf_used, 0);
+    io_uring_prep_recv(sqe, mcmc_fd(c->mcmc), c->rb.data + c->rb.used, c->rb.size - c->rb.used, 0);
     io_uring_sqe_set_data(sqe, &f->ev);
 
     _evset_link_timeout(f);
@@ -505,6 +505,12 @@ static int mcs_lock_buf_used(struct mcs_lock_buf *b) {
     return used;
 }
 
+static void mcs_buf_init(struct mcs_buf *b, size_t size) {
+    memset(b, 0, sizeof(*b));
+    b->data = malloc(size);
+    b->size = size;
+}
+
 // For this codebase these buffers tend to settle into a certain size,
 // and we don't shrink them. Increasing by chunks of the original size should
 // help avoid memory bloat.
@@ -514,6 +520,7 @@ static void mcs_check_buf(struct mcs_buf *b, size_t len) {
     }
 
     while (b->used + len > b->size) {
+        // FIXME: remember and increase by a multiple of the initial size?
         b->size += BUF_INITIAL_SIZE;
     }
     char *nb = realloc(b->data, b->size);
@@ -524,29 +531,22 @@ static void mcs_check_buf(struct mcs_buf *b, size_t len) {
     b->data = nb;
 }
 
-static void mcs_expand_rbuf(struct mcs_func_client *c) {
-    if (c->rbuf_used == c->rbuf_size) {
-        c->rbuf_size *= 2;
-        char *nrb = realloc(c->rbuf, c->rbuf_size);
-        if (nrb == NULL) {
-            fprintf(stderr, "Failed to realloc read buffer\n");
-            abort();
-        }
-        c->rbuf = nrb;
-    }
+static void mcs_reset_buf(struct mcs_buf *b) {
+    char *data = b->data;
+    size_t size = b->size;
+    memset(b, 0, sizeof(struct mcs_buf));
+    b->size = size;
+    b->data = data;
 }
 
-// yes this should be a "buf" abstraction
-static void mcs_expand_wbuf(struct mcs_func_client *c, size_t len) {
-    while (c->wbuf_used + len > c->wbuf_size) {
-        c->wbuf_size *= 2;
+static void mcs_consume_buf(struct mcs_buf *b) {
+    if (b->toconsume != 0) {
+        b->used -= b->toconsume;
+        if (b->used > 0) {
+            memmove(b->data, b->data+b->toconsume, b->used);
+        }
+        b->toconsume = 0;
     }
-    char *nwb = realloc(c->wbuf, c->wbuf_size);
-    if (nwb == NULL) {
-        fprintf(stderr, "Failed to realloc write buffer\n");
-        abort();
-    }
-    c->wbuf = nwb;
 }
 
 // The connect routine isn't very "io_uring-y", as it calls
@@ -555,8 +555,8 @@ static void mcs_expand_wbuf(struct mcs_func_client *c, size_t len) {
 // over uring.
 static int mcs_connect(struct mcs_func_client *c) {
     int status = mcmc_connect(c->mcmc, c->conn.host, c->conn.port_num, MCMC_OPTION_NONBLOCK);
-    c->rbuf_used = 0;
-    c->rbuf_toconsume = 0;
+    mcs_reset_buf(&c->wb);
+    mcs_reset_buf(&c->rb);
     if (status == MCMC_CONNECTED) {
         // NOTE: find when this is possible?
         fprintf(stderr, "Client connected unexpectedly, please report this\n");
@@ -574,15 +574,16 @@ static int mcs_connect(struct mcs_func_client *c) {
 
 void mcs_postflush(struct mcs_func *f, struct mcs_func_client *c) {
     int res = f->cqe_res;
+    struct mcs_buf *b = &c->wb;
 
     if (res > 0) {
-        c->wbuf_sent += res;
-        if (c->wbuf_sent < c->wbuf_used) {
+        b->offset += res;
+        if (b->offset < b->used) {
             // need to continue flushing write buffer.
             f->state = mcs_fstate_flush;
         } else {
-            c->wbuf_sent = 0;
-            c->wbuf_used = 0;
+            b->offset = 0;
+            b->used = 0;
             f->state = mcs_fstate_run;
         }
     } else if (res < 0) {
@@ -602,49 +603,40 @@ void mcs_postflush(struct mcs_func *f, struct mcs_func_client *c) {
     }
 }
 
-static void _mcs_consume_buf(struct mcs_func_client *c) {
-    if (c->rbuf_toconsume != 0) {
-        c->rbuf_used -= c->rbuf_toconsume;
-        if (c->rbuf_used > 0) {
-            memmove(c->rbuf, c->rbuf+c->rbuf_toconsume, c->rbuf_used);
-        }
-        c->rbuf_toconsume = 0;
-    }
-}
-
 // Note: this function throws away the response object if it needs to read
 // more data from the socket, re-parsing after another read attempt.
 // This should be an extremely rare case, and parsing is fast enough that I
 // don't want to add more logic around this right now.
 static int mcs_read_buf(struct mcs_func *f, struct mcs_func_client *c) {
     int ret = 0; // RUN
-    char *rbuf_offset = c->rbuf + c->rbuf_toconsume;
-    int rbuf_remain = c->rbuf_used - c->rbuf_toconsume;
+    struct mcs_buf *b = &c->rb;
+    char *rbuf_offset = b->data + b->toconsume;
+    int rbuf_remain = b->used - b->toconsume;
     if (f->buf_readline == 0) {
         struct mcs_func_resp *r = lua_touserdata(f->L, -1);
         memset(r, 0, sizeof(*r));
         r->status = mcmc_parse_buf(rbuf_offset, rbuf_remain, &r->resp);
         if (r->status == MCMC_OK) {
             if (r->resp.vlen != r->resp.vlen_read) {
-                if (c->rbuf_toconsume != 0) {
+                if (b->toconsume != 0) {
                     // vlen didn't fit, but we are read partway into the
                     // buffer.
                     // memmove the buffer and read out.
-                    _mcs_consume_buf(c);
+                    mcs_consume_buf(&c->rb);
                 } else {
                     // ... else the read buffer simply wasn't large enough.
-                    mcs_expand_rbuf(c);
+                    mcs_check_buf(&c->rb, RBUF_INITIAL_SIZE);
                 }
                 ret = 1; // WANT_READ
             } else {
                 r->buf = rbuf_offset;
                 f->lua_nargs = 0;
-                c->rbuf_toconsume += r->resp.reslen + r->resp.vlen_read;
+                b->toconsume += r->resp.reslen + r->resp.vlen_read;
 
                 clock_gettime(CLOCK_MONOTONIC, &r->received);
             }
         } else if (r->resp.code == MCMC_WANT_READ) {
-            mcs_expand_rbuf(c);
+            mcs_check_buf(&c->rb, RBUF_INITIAL_SIZE);
             ret = 1;
         } else {
             switch (r->resp.type) {
@@ -656,7 +648,7 @@ static int mcs_read_buf(struct mcs_func *f, struct mcs_func_client *c) {
                         // SERVER_ERROR can be handled upstream
                         r->buf = rbuf_offset;
                         f->lua_nargs = 0;
-                        c->rbuf_toconsume += r->resp.reslen;
+                        b->toconsume += r->resp.reslen;
                         clock_gettime(CLOCK_MONOTONIC, &r->received);
                     }
                     break;
@@ -678,7 +670,7 @@ static int mcs_read_buf(struct mcs_func *f, struct mcs_func_client *c) {
             // always big enough for one line. Could probably add the
             // detection code anyway once I'm sure this works?
             size_t len = end - rbuf_offset + 1;
-            c->rbuf_toconsume += len;
+            b->toconsume += len;
             if (len < 2) {
                 fprintf(stderr, "Protocol error, short response: %d\n", (int)len);
                 ret = -1;
@@ -693,7 +685,7 @@ static int mcs_read_buf(struct mcs_func *f, struct mcs_func_client *c) {
             }
         } else {
             // in case we were reading off the end of the data buffer.
-            _mcs_consume_buf(c);
+            mcs_consume_buf(&c->rb);
             ret = 1; // WANT_READ
         }
     }
@@ -705,7 +697,7 @@ static void mcs_postread(struct mcs_func *f, struct mcs_func_client *c) {
     int res = f->cqe_res;
 
     if (res > 0) {
-        c->rbuf_used += res;
+        c->rb.used += res;
         int ret = mcs_read_buf(f, c);
         if (ret == 0) {
             f->state = mcs_fstate_run;
@@ -1040,6 +1032,7 @@ static int mcslib_write_c(struct mcs_func *f, struct mcs_func_client *c) {
     int vlen = 0;
     const char *rline = NULL;
     struct mcs_func_req *req = NULL;
+    struct mcs_buf *b = &c->wb;
 
     if (type == LUA_TUSERDATA) {
         req = lua_touserdata(f->L, -1);
@@ -1051,16 +1044,16 @@ static int mcslib_write_c(struct mcs_func *f, struct mcs_func_client *c) {
         rline = luaL_tolstring(f->L, -1, &len);
     }
 
-    mcs_expand_wbuf(c, len + vlen + 2);
+    mcs_check_buf(&c->wb, len + vlen + 2);
 
-    memcpy(c->wbuf + c->wbuf_used, rline, len);
-    c->wbuf_used += len;
+    memcpy(b->data + b->used, rline, len);
+    b->used += len;
 
     lua_pop(f->L, 1);
 
     if (vlen != 0) {
-        char *p = _mcs_write_value(req->hash, vlen, (char *)c->wbuf + c->wbuf_used);
-        c->wbuf_used += p - (c->wbuf + c->wbuf_used);
+        char *p = _mcs_write_value(req->hash, vlen, (char *)b->data + b->used);
+        b->used += p - (b->data + b->used);
     }
     return 0;
 }
@@ -1072,9 +1065,9 @@ static int mcslib_write_c_factory(struct mcs_func *f, struct mcs_func_client *c,
     struct mcs_func_req *req = lua_touserdata(f->L, offset + 1);
     int32_t vlen = 0;
 
-    mcs_expand_wbuf(c, REQ_MAX_LENGTH);
+    mcs_check_buf(&c->wb, REQ_MAX_LENGTH);
 
-    char *p = c->wbuf + c->wbuf_used;
+    char *p = c->wb.data + c->wb.used;
     char *start = p;
 
     memcpy(p, "m  ", 3);
@@ -1108,7 +1101,7 @@ static int mcslib_write_c_factory(struct mcs_func *f, struct mcs_func_client *c,
     }
 
     clock_gettime(CLOCK_MONOTONIC, &req->start);
-    c->wbuf_used += p - start;
+    c->wb.used += p - start;
 
     return 0;
 }
@@ -1117,12 +1110,13 @@ static int mcslib_write_c_factory(struct mcs_func *f, struct mcs_func_client *c,
 // "MCMC_WANT_READ" to avoid memmove's in most/many cases.
 // Avoiding this optimization for now for stability.
 static int mcslib_read_c(struct mcs_func_client *c) {
-    if (c->rbuf_toconsume == c->rbuf_used) {
-        c->rbuf_used = 0;
-        c->rbuf_toconsume = 0;
+    struct mcs_buf *b = &c->rb;
+    if (b->toconsume == b->used) {
+        b->used = 0;
+        b->toconsume = 0;
     }
 
-    if (c->rbuf_used == 0) {
+    if (b->used == 0) {
         return 0;
     } else {
         return 1;
@@ -1156,7 +1150,7 @@ static int mcs_func_lua_yield(struct mcs_func *f, int nresults) {
             res = mcslib_write_c_factory(f, &f->c, 0);
             break;
         case mcs_luayield_flush:
-            f->c.wbuf_sent = 0;
+            f->c.wb.offset = 0;
             f->state = mcs_fstate_flush;
             break;
         case mcs_luayield_read:
@@ -1217,7 +1211,7 @@ static int mcs_func_lua_yield(struct mcs_func *f, int nresults) {
             break;
         case mcs_luayield_c_flush:
             c = lua_touserdata(f->L, 1);
-            c->wbuf_sent = 0;
+            c->wb.offset = 0;
             f->state = mcs_fstate_flush;
             break;
         default:
@@ -1457,11 +1451,8 @@ static struct mcs_func *mcs_add_func(struct mcs_thread *t) {
     f->ev.udata = f;
     f->state = mcs_fstate_disconn;
 
-    f->c.wbuf = malloc(WBUF_INITIAL_SIZE);
-    f->c.wbuf_size = WBUF_INITIAL_SIZE;
-
-    f->c.rbuf = malloc(RBUF_INITIAL_SIZE);
-    f->c.rbuf_size = RBUF_INITIAL_SIZE;
+    mcs_buf_init(&f->c.wb, WBUF_INITIAL_SIZE);
+    mcs_buf_init(&f->c.rb, RBUF_INITIAL_SIZE);
 
     return f;
 }
@@ -1778,8 +1769,8 @@ static void _mcs_cleanup_thread(struct mcs_thread *t) {
         if (f->c.mcmc) {
             mcmc_disconnect(f->c.mcmc);
         }
-        free(f->c.rbuf);
-        free(f->c.wbuf);
+        free(f->c.rb.data);
+        free(f->c.wb.data);
         free(f->c.mcmc);
         free(f->fname);
         // TODO: if we upgrade to 5.4.6 use closethread instead. resetthread
@@ -1987,11 +1978,8 @@ static int mcslib_client_new(lua_State *L) {
     // allocate mcmc client
     c->mcmc = calloc(1, mcmc_size(MCMC_OPTION_BLANK));
 
-    c->wbuf = malloc(WBUF_INITIAL_SIZE);
-    c->wbuf_size = WBUF_INITIAL_SIZE;
-
-    c->rbuf = malloc(RBUF_INITIAL_SIZE);
-    c->rbuf_size = RBUF_INITIAL_SIZE;
+    mcs_buf_init(&c->wb, WBUF_INITIAL_SIZE);
+    mcs_buf_init(&c->rb, RBUF_INITIAL_SIZE);
 
     // return client object.
     return 1;
@@ -2236,7 +2224,7 @@ static int mcslib_client_write_mgres_to_ms(lua_State *L) {
     }
 
     // make sure we have headroom in the dest wbuf
-    mcs_expand_wbuf(c, r->resp.reslen + r->resp.vlen);
+    mcs_check_buf(&c->wb, r->resp.reslen + r->resp.vlen);
 
     // find the key token from response
     int x = 1; // index of first flag
@@ -2251,7 +2239,7 @@ static int mcslib_client_write_mgres_to_ms(lua_State *L) {
     }
 
     // write "ms key len"
-    char *p = c->wbuf + c->wbuf_used;
+    char *p = c->wb.data + c->wb.used;
     memcpy(p, "ms ", 3);
     p += 3;
 
@@ -2321,7 +2309,7 @@ static int mcslib_client_write_mgres_to_ms(lua_State *L) {
     p += r->resp.vlen;
 
     // note buffer usage.
-    c->wbuf_used += p - (c->wbuf + c->wbuf_used);
+    c->wb.used += p - (c->wb.data + c->wb.used);
 
     lua_pushboolean(L, 1);
     return 1;
@@ -2858,8 +2846,8 @@ static int mcslib_client_gc(lua_State *L) {
     // check routine just in case GC is called multiple times.
     if (c->mcmc) {
         mcmc_disconnect(c->mcmc);
-        free(c->rbuf);
-        free(c->wbuf);
+        free(c->rb.data);
+        free(c->wb.data);
         free(c->mcmc);
         c->mcmc = NULL;
     }
