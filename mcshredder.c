@@ -16,7 +16,6 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <ctype.h>
 #include <errno.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -29,6 +28,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <time.h>
+#include <stdbool.h>
 
 #include <lua.h>
 #include <lualib.h>
@@ -80,12 +80,12 @@ struct mcs_ctx;
 static void register_lua_libs(lua_State *L);
 static void mcs_queue_cb(void *udata, struct io_uring_cqe *cqe);
 static int mcs_func_lua(struct mcs_func *f);
+static int mcs_func_run(void *udata);
 static void mcs_start_limiter(struct mcs_func *f);
 static void _mcs_cleanup_thread(struct mcs_thread *t);
+static bool mcs_postread(struct mcs_func *f, struct mcs_func_client *c);
 
 typedef void (*event_cb)(void *udata, struct io_uring_cqe *cqe);
-// return -1 if failure to get sqe
-typedef int (*queue_cb)(void *udata);
 struct mcs_event {
     void *udata;
     event_cb cb;
@@ -104,26 +104,6 @@ struct mcs_f_rate {
 struct mcs_f_reconn {
     unsigned int every; // how often to reconnect
     unsigned int after; // counter until next reconnect
-};
-
-// TODO: func or macro for state changes so can be printed.
-enum mcs_func_state {
-    mcs_fstate_disconn = 0,
-    mcs_fstate_connecting,
-    mcs_fstate_postconnect,
-    mcs_fstate_retry,
-    mcs_fstate_postretry,
-    mcs_fstate_run,
-    mcs_fstate_flush,
-    mcs_fstate_postflush,
-    mcs_fstate_read,
-    mcs_fstate_postread,
-    mcs_fstate_rerun,
-    mcs_fstate_restart,
-    mcs_fstate_syserr,
-    mcs_fstate_outwait,
-    mcs_fstate_sleep,
-    mcs_fstate_stop,
 };
 
 enum mcs_lua_yield {
@@ -242,6 +222,9 @@ struct mcs_ctx {
     thread_head_t threads; // stack of threads
     pthread_cond_t wait_cond; // thread completion signal
     pthread_mutex_t wait_lock;
+#ifdef USE_TLS
+    void *tls_ctx; // global SSL CTX object
+#endif
     struct mcs_lock_buf out_buf; // out/listener stream buffer.
     eventfd_t out_fd;
     uint64_t out_readvar; // let io_uring put eventfd res somewhere.
@@ -463,6 +446,26 @@ static void _evset_wrflush(struct mcs_func *f, struct mcs_func_client *c) {
     _evset_link_timeout(f);
 }
 
+void _evset_wrflush_data(struct mcs_func *f, struct mcs_func_client *c, char *data, long len) {
+    struct io_uring_sqe *sqe;
+
+    sqe = io_uring_get_sqe(&f->parent->ring);
+
+    io_uring_prep_write(sqe, mcmc_fd(c->mcmc), data, len, 0);
+    io_uring_sqe_set_data(sqe, &f->ev);
+
+    _evset_link_timeout(f);
+}
+
+void _evset_read_data(struct mcs_func *f, struct mcs_func_client *c, char *data, long len) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&f->parent->ring);
+
+    io_uring_prep_recv(sqe, mcmc_fd(c->mcmc), data, len, 0);
+    io_uring_sqe_set_data(sqe, &f->ev);
+
+    _evset_link_timeout(f);
+}
+
 static void _evset_read(struct mcs_func *f, struct mcs_func_client *c) {
     struct io_uring_sqe *sqe;
 
@@ -497,6 +500,39 @@ static void _evset_cancel(struct mcs_func *f) {
 
 // *** CORE ***
 
+int mcs_func_cqe_res(struct mcs_func *f) {
+    return f->cqe_res;
+}
+
+void mcs_func_set_cqe_res(struct mcs_func *f, int res) {
+    f->cqe_res = res;
+}
+
+struct mcs_func_client *mcs_func_get_client(struct mcs_func *f) {
+    struct mcs_func_client *c = NULL;
+    if (f->c.mcmc) {
+        return c = &f->c;
+    } else {
+        // FIXME: gross. This requires the caller to assume that if it wants a
+        // client, one is currently sitting in the stack.
+        // Which should be generally true: however fixing the callback system
+        // so we can also override the callback data will remove the need for
+        // this function.
+        c = lua_touserdata(f->L, 1);
+    }
+    return c;
+}
+
+// TODO: ifdef a STATE_DEBUG with a print.
+void mcs_func_set_state(struct mcs_func *f, enum mcs_func_state s) {
+    f->state = s;
+}
+
+static void mcs_client_init(struct mcs_func_client *c) {
+    c->s_read = mcs_fstate_read;
+    c->s_flush = mcs_fstate_flush;
+}
+
 static int mcs_lock_buf_used(struct mcs_lock_buf *b) {
     int used = 0;
     pthread_mutex_lock(&b->lock);
@@ -505,7 +541,7 @@ static int mcs_lock_buf_used(struct mcs_lock_buf *b) {
     return used;
 }
 
-static void mcs_buf_init(struct mcs_buf *b, size_t size) {
+void mcs_buf_init(struct mcs_buf *b, size_t size) {
     memset(b, 0, sizeof(*b));
     b->data = malloc(size);
     b->size = size;
@@ -580,7 +616,7 @@ void mcs_postflush(struct mcs_func *f, struct mcs_func_client *c) {
         b->offset += res;
         if (b->offset < b->used) {
             // need to continue flushing write buffer.
-            f->state = mcs_fstate_flush;
+            f->state = c->s_flush;
         } else {
             b->offset = 0;
             b->used = 0;
@@ -693,7 +729,7 @@ static int mcs_read_buf(struct mcs_func *f, struct mcs_func_client *c) {
     return ret;
 }
 
-static void mcs_postread(struct mcs_func *f, struct mcs_func_client *c) {
+static bool mcs_postread(struct mcs_func *f, struct mcs_func_client *c) {
     int res = f->cqe_res;
 
     if (res > 0) {
@@ -702,7 +738,7 @@ static void mcs_postread(struct mcs_func *f, struct mcs_func_client *c) {
         if (ret == 0) {
             f->state = mcs_fstate_run;
         } else if (ret == 1) {
-            f->state = mcs_fstate_read;
+            f->state = c->s_read;
         } else if (ret < 0) {
             f->reserr = ret;
             f->state = mcs_fstate_syserr;
@@ -722,6 +758,8 @@ static void mcs_postread(struct mcs_func *f, struct mcs_func_client *c) {
         f->reserr = 0;
         f->state = mcs_fstate_syserr;
     }
+
+    return true; // nonsense from the state machine.
 }
 
 static void mcs_reschedule(struct mcs_func *f) {
@@ -795,7 +833,9 @@ static int mcs_func_run(void *udata) {
     switch (f->state) {
         case mcs_fstate_disconn:
             if (mcs_connect(&f->c) == 0) {
+                _evset_wrpoll(f, &f->c);
                 f->state = mcs_fstate_connecting;
+                stop = true;
             } else {
                 mcmc_disconnect(f->c.mcmc);
                 f->c.connected = false;
@@ -803,20 +843,28 @@ static int mcs_func_run(void *udata) {
             }
             break;
         case mcs_fstate_connecting:
-            _evset_wrpoll(f, &f->c);
-            f->state = mcs_fstate_postconnect;
-            stop = true;
-            break;
-        case mcs_fstate_postconnect:
             if (mcmc_check_nonblock_connect(f->c.mcmc, &err) != MCMC_OK) {
                 mcmc_disconnect(f->c.mcmc);
                 f->c.connected = false;
                 f->state = mcs_fstate_retry;
             } else {
-                f->c.connected = true;
-                mcs_start_limiter(f);
-                f->state = mcs_fstate_rerun;
+                if (f->c.tls) {
+                    stop = mcs_tls_postconnect(f, &f->c);
+                } else {
+                    f->state = mcs_fstate_postconnect;
+                }
             }
+            break;
+        case mcs_fstate_tls_hs_postread:
+            stop = mcs_tls_hs_postread(f);
+            break;
+        case mcs_fstate_tls_hs_postwrite:
+            stop = mcs_tls_hs_postwrite(f);
+            break;
+        case mcs_fstate_postconnect:
+            f->c.connected = true;
+            mcs_start_limiter(f);
+            f->state = mcs_fstate_rerun;
             break;
         case mcs_fstate_run:
             if (mcs_func_lua(f)) {
@@ -841,11 +889,23 @@ static int mcs_func_run(void *udata) {
             break;
         case mcs_fstate_read:
             _evset_read(f, &f->c);
-            f->state = mcs_fstate_postread;
+            mcs_func_set_state(f, mcs_fstate_postread);
             stop = true;
             break;
         case mcs_fstate_postread:
             mcs_postread(f, &f->c);
+            break;
+        case mcs_fstate_tls_read:
+            stop = mcs_tls_read(f, &f->c);
+            break;
+        case mcs_fstate_tls_postread:
+            stop = mcs_tls_postread(f, &f->c);
+            break;
+        case mcs_fstate_tls_flush:
+            stop = mcs_tls_flush(f, &f->c);
+            break;
+        case mcs_fstate_tls_postflush:
+            stop = mcs_tls_postflush(f, &f->c);
             break;
         case mcs_fstate_retry:
             _evset_retry_timeout(f);
@@ -888,22 +948,30 @@ static int mcs_cfunc_run(void *udata) {
     switch (f->state) {
         case mcs_fstate_connecting:
             c = lua_touserdata(f->L, 1);
-            _evset_wrpoll(f, c);
-            f->state = mcs_fstate_postconnect;
-            stop = true;
-            break;
-        case mcs_fstate_postconnect:
-            c = lua_touserdata(f->L, 1);
             if (mcmc_check_nonblock_connect(c->mcmc, &err) != MCMC_OK) {
                 mcmc_disconnect(c->mcmc);
                 c->connected = false;
                 lua_pushboolean(f->L, 0);
                 f->lua_nargs = 1;
             } else {
-                c->connected = true;
-                lua_pushboolean(f->L, 1);
-                f->lua_nargs = 1;
+                if (c->tls) {
+                    stop = mcs_tls_postconnect(f, c);
+                } else {
+                    f->state = mcs_fstate_postconnect;
+                }
             }
+            break;
+        case mcs_fstate_tls_hs_postread:
+            stop = mcs_tls_hs_postread(f);
+            break;
+        case mcs_fstate_tls_hs_postwrite:
+            stop = mcs_tls_hs_postwrite(f);
+            break;
+        case mcs_fstate_postconnect:
+            c = lua_touserdata(f->L, 1);
+            c->connected = true;
+            lua_pushboolean(f->L, 1);
+            f->lua_nargs = 1;
             f->state = mcs_fstate_run;
             break;
         case mcs_fstate_read:
@@ -941,6 +1009,24 @@ static int mcs_cfunc_run(void *udata) {
             c = lua_touserdata(f->L, 1);
             mcs_postflush(f, c);
             break;
+        case mcs_fstate_tls_read:
+            // FIXME: need to do the !connected check like in fstate_read?
+            // do the same with all the below funcs.
+            c = lua_touserdata(f->L, 1);
+            stop = mcs_tls_read(f, c);
+            break;
+        case mcs_fstate_tls_postread:
+            c = lua_touserdata(f->L, 1);
+            stop = mcs_tls_postread(f, c);
+            break;
+        case mcs_fstate_tls_flush:
+            c = lua_touserdata(f->L, 1);
+            stop = mcs_tls_flush(f, c);
+            break;
+        case mcs_fstate_tls_postflush:
+            c = lua_touserdata(f->L, 1);
+            stop = mcs_tls_postflush(f, c);
+            break;
         case mcs_fstate_syserr:
             c = lua_touserdata(f->L, 1);
             mcmc_disconnect(c->mcmc);
@@ -963,8 +1049,15 @@ static int mcs_cfunc_run(void *udata) {
             }
             break;
         case mcs_fstate_run:
-            if (mcs_func_lua(f)) {
-                f->state = mcs_fstate_stop;
+            switch (mcs_func_lua(f)) {
+                case 0:
+                    break; // do nothing
+                case 1:
+                    f->state = mcs_fstate_stop; // complete
+                    break;
+                case 2:
+                    stop = true; // resume later.
+                    break;
             }
             break;
         case mcs_fstate_sleep:
@@ -1151,7 +1244,7 @@ static int mcs_func_lua_yield(struct mcs_func *f, int nresults) {
             break;
         case mcs_luayield_flush:
             f->c.wb.offset = 0;
-            f->state = mcs_fstate_flush;
+            f->state = f->c.s_flush;
             break;
         case mcs_luayield_read:
             if (mcslib_read_c(&f->c)) {
@@ -1159,13 +1252,13 @@ static int mcs_func_lua_yield(struct mcs_func *f, int nresults) {
                 if (ret == 0) {
                     f->state = mcs_fstate_run;
                 } else if (ret == 1) {
-                    f->state = mcs_fstate_read;
+                    f->state = f->c.s_read;
                 } else if (ret < 0) {
                     f->reserr = 1;
                     f->state = mcs_fstate_syserr;
                 }
             } else {
-                f->state = mcs_fstate_read;
+                f->state = f->c.s_read;
             }
             break;
         case mcs_luayield_sleep:
@@ -1180,7 +1273,10 @@ static int mcs_func_lua_yield(struct mcs_func *f, int nresults) {
             }
             break;
         case mcs_luayield_c_conn:
+            c = lua_touserdata(f->L, 1);
+            _evset_wrpoll(f, c);
             f->state = mcs_fstate_connecting;
+            res = 2; // stop caller state machine.
             break;
         case mcs_luayield_c_readline:
             f->buf_readline = 1;
@@ -1192,13 +1288,13 @@ static int mcs_func_lua_yield(struct mcs_func *f, int nresults) {
                 if (ret == 0) {
                     f->state = mcs_fstate_run;
                 } else if (ret == 1) {
-                    f->state = mcs_fstate_read;
+                    f->state = c->s_read;
                 } else if (ret < 0) {
                     f->reserr = ret;
                     f->state = mcs_fstate_syserr;
                 }
             } else {
-                f->state = mcs_fstate_read;
+                f->state = c->s_read;
             }
             break;
         case mcs_luayield_c_write:
@@ -1212,7 +1308,7 @@ static int mcs_func_lua_yield(struct mcs_func *f, int nresults) {
         case mcs_luayield_c_flush:
             c = lua_touserdata(f->L, 1);
             c->wb.offset = 0;
-            f->state = mcs_fstate_flush;
+            f->state = c->s_flush;
             break;
         default:
             fprintf(stderr, "Unhandled yield state, aborting\n");
@@ -1444,6 +1540,8 @@ static struct mcs_func *mcs_add_func(struct mcs_thread *t) {
 
     // allocate mcmc client
     f->c.mcmc = calloc(1, mcmc_size(MCMC_OPTION_BLANK));
+    // set our back reference for callback handling later.
+    f->c.parent = f;
 
     // kick off the state machine.
     f->ev.qcb = mcs_func_run;
@@ -1453,6 +1551,12 @@ static struct mcs_func *mcs_add_func(struct mcs_thread *t) {
 
     mcs_buf_init(&f->c.wb, WBUF_INITIAL_SIZE);
     mcs_buf_init(&f->c.rb, RBUF_INITIAL_SIZE);
+    mcs_client_init(&f->c);
+#ifdef USE_TLS
+    if (t->ctx->tls_ctx) {
+        mcs_tls_client_init(&f->c, t->ctx->tls_ctx);
+    }
+#endif
 
     return f;
 }
@@ -1980,6 +2084,12 @@ static int mcslib_client_new(lua_State *L) {
 
     mcs_buf_init(&c->wb, WBUF_INITIAL_SIZE);
     mcs_buf_init(&c->rb, RBUF_INITIAL_SIZE);
+    mcs_client_init(c);
+#ifdef USE_TLS
+    if (t->ctx->tls_ctx) {
+        mcs_tls_client_init(c, t->ctx->tls_ctx);
+    }
+#endif
 
     // return client object.
     return 1;
@@ -2959,6 +3069,9 @@ static void usage(struct mcs_ctx *ctx) {
            "--port=<port> (11211): Port to connect to\n"
            "--conf=<file> (none): Lua configuration file\n"
            "--arg=<key,key=val,key2=val2> (none): arguments to pass to config script\n"
+#ifdef USE_TLS
+           "--tls: use TLS for talking to memcached\n"
+#endif
            "--memprofile: print allocation statistics once per second\n"
           );
     lua_getglobal(ctx->L, "help");
@@ -2978,6 +3091,7 @@ int main(int argc, char **argv) {
         {"conf", required_argument, 0, 'c'},
         {"arg", required_argument, 0, 'a'},
         {"memprofile", no_argument, 0, 'm'},
+        {"tls", no_argument, 0, 't'},
         {"help", no_argument, 0, 'h'},
         // end
         {0, 0, 0, 0}
@@ -3032,6 +3146,12 @@ int main(int argc, char **argv) {
                 exit(EXIT_FAILURE);
             }
             break;
+#ifdef USE_TLS
+        case 't':
+            // TODO: err if nil
+            ctx->tls_ctx = mcs_tls_init();
+            break;
+#endif
         case 'm':
             ctx->memprofile = true;
             break;

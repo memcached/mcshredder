@@ -41,6 +41,10 @@ Sorry about the bare makefile; low priority :)
 --port [11211]
  - port to connect to
 
+--tls
+ - Use TLS if compiled in (see below)
+```
+
 ## Configuration
 
 See conf/example.lua for an introduction to the configuration language.
@@ -48,3 +52,10 @@ See conf/example.lua for an introduction to the configuration language.
 Please keep in mind: This is a benchmark tool, and as such we try to minimize
 overhead. There is minimal argument checking, minimal error handling, etc. Try
 to keep configuration files straightforward and simple.
+
+## TLS
+
+With OpenSSL installed, run `make tls` to enable TLS mode. Note this feature
+is new as of July 2024 and has poor error handling. If you run into errors
+please let us know and we'll prioritize that fix. We'll be improving the TLS
+support on a low priority basis.
