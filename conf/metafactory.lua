@@ -42,21 +42,21 @@ function basic(a)
     local pfx = a.prefix
     local size = a.vsize
     local req = mcs.mg_factory(pfx, "v")
-    local res = mcs.res_new()
+    local set_res = mcs.res_new()
 
     return function()
         local num = math.random(total)
         mcs.write_factory(req, num)
         mcs.flush()
 
-        mcs.read(res)
-        if mcs.res_startswith(res, "EN") then
+        mcs.read(set_res)
+        if mcs.res_startswith(set_res, "EN") then
             print("miss")
 --[[
             local set = mcs.set(prefix, num, 0, 30, size)
             mcs.write(set)
             mcs.flush()
-            local res = mcs.read()
+            mcs.read(set_res)
 --]]
         end
     end
@@ -80,7 +80,8 @@ function basic_noinit(a)
         local set = mcs.set(a.prefix, num, 0, 30, a.vsize)
         mcs.write(set)
         mcs.flush()
-        local res = mcs.read()
+        local res = mcs.res_new()
+        mcs.read(res)
     end
 --]]
 end
@@ -133,5 +134,3 @@ function statsample()
     previous_stats = stats
     stats_ready = true
 end
-
-

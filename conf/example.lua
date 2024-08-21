@@ -74,7 +74,8 @@ function warm()
     local req = mcs.set("doot", counter, 0, 300, 50)
     mcs.write(req)
     mcs.flush()
-    local res = mcs.read()
+    local res = mcs.res_new()
+    mcs.read(res)
     counter = counter + 1
 end
 
@@ -96,7 +97,8 @@ function basic()
     mcs.flush()
 
     -- wait for a response and parse it into a response object.
-    local res = mcs.read()
+    local res = mcs.res_new()
+    mcs.read(res)
     -- NOTE: a response object is only valid until the next time mcs.read() is
     -- called: res points directly into the client read buffer, which moves
     -- every time read() is called.
@@ -107,11 +109,13 @@ function basic()
         local set = mcs.set("toast/", num, 0, 90, 100)
         mcs.write(set)
         mcs.flush()
-        local res = mcs.read()
+        local res = mcs.res_new()
+        mcs.read(res)
         -- note validating the response here is optional.
     else
         -- If we got a hit, we need to still read the END marker.
-        local res = mcs.read()
+        local res = mcs.res_new()
+        mcs.read(res)
         -- note we're not validating the END marker here.
     end
 end
@@ -121,12 +125,14 @@ function metaget()
     local req = mcs.mg("toast/", num, "v")
     mcs.write(req)
     mcs.flush()
-    local res = mcs.read()
+    local res = mcs.res_new()
+    mcs.read(res)
     if mcs.resline(res) == "EN" then
         local set = mcs.ms("toast/", num, 50, "T90")
         mcs.write(set)
         mcs.flush()
-        local res = mcs.read()
+        local res = mcs.res_new()
+        mcs.read(res)
     else
         local status, elapsed = mcs.match(req, res)
         if not status then
@@ -143,7 +149,8 @@ function latency()
     mcs.write(req)
     mcs.flush()
 
-    local res = mcs.read()
+    local res = mcs.res_new()
+    mcs.read(res)
     -- NOTE: as of writing "status" is meaningless.
     -- mcs.match(req, res) will do basic validation that the response makes
     -- sense for the request.
@@ -167,7 +174,8 @@ function statsample()
     mcs.flush()
     local stats = {}
     while true do
-        local res = mcs.read()
+        local res = mcs.res_new()
+        mcs.read(res)
         if mcs.resline(res) == "END" then
             break
         end
@@ -184,5 +192,3 @@ function statsample()
     previous_stats = stats
     stats_ready = true
 end
-
-
