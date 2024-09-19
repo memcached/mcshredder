@@ -1912,9 +1912,11 @@ static int mcslib_shredder(lua_State *L) {
     for (int x = 1; x <= n; x++) {
         lua_geti(L, 1, x);
         struct mcs_thread *t = lua_touserdata(L, -1);
+        if (t) {
+            STAILQ_INSERT_TAIL(&ctx->threads, t, next);
+            ctx->active_threads++;
+        }
         lua_pop(L, 1);
-        STAILQ_INSERT_TAIL(&ctx->threads, t, next);
-        ctx->active_threads++;
     }
 
     pthread_mutex_lock(&ctx->wait_lock);
