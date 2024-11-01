@@ -110,6 +110,7 @@ enum mcs_lua_yield {
     mcs_luayield_write = 0,
     mcs_luayield_write_factory,
     mcs_luayield_flush,
+    mcs_luayield_disconnect,
     mcs_luayield_read,
     mcs_luayield_sleep,
     mcs_luayield_outwait,
@@ -1246,6 +1247,11 @@ static int mcs_func_lua_yield(struct mcs_func *f, int nresults) {
             f->c.wb.offset = 0;
             f->state = f->c.s_flush;
             break;
+        case mcs_luayield_disconnect:
+            mcmc_disconnect(f->c.mcmc);
+            f->c.connected = false;
+            f->state = mcs_fstate_disconn;
+            break;
         case mcs_luayield_read:
             if (mcslib_read_c(&f->c)) {
                 int ret = mcs_read_buf(f, &f->c);
@@ -2113,6 +2119,15 @@ static int mcslib_client_connect(lua_State *L) {
     return 0;
 }
 
+static int mcslib_client_disconnect(lua_State *L) {
+    struct mcs_func_client *c = lua_touserdata(L, 1);
+    if (c->connected) {
+        mcmc_disconnect(c->mcmc);
+        c->connected = false;
+    }
+    return 0;
+}
+
 // yield new state for calling mcs_read_buf but against an external
 // client object.
 static int mcslib_client_read(lua_State *L) {
@@ -2170,6 +2185,11 @@ static int mcslib_write_factory(lua_State *L) {
 
 static int mcslib_flush(lua_State *L) {
     lua_pushinteger(L, mcs_luayield_flush);
+    return lua_yield(L, 1);
+}
+
+static int mcslib_disconnect(lua_State *L) {
+    lua_pushinteger(L, mcs_luayield_disconnect);
     return lua_yield(L, 1);
 }
 
@@ -2978,6 +2998,7 @@ static void register_lua_libs(lua_State *L) {
         // custom func functions.
         {"client_new", mcslib_client_new},
         {"client_connect", mcslib_client_connect},
+        {"client_disconnect", mcslib_client_disconnect},
         {"client_read", mcslib_client_read},
         {"client_write", mcslib_client_write},
         {"client_write_factory", mcslib_client_write_factory},
@@ -2994,6 +3015,7 @@ static void register_lua_libs(lua_State *L) {
         {"write", mcslib_write},
         {"write_factory", mcslib_write_factory},
         {"flush", mcslib_flush},
+        {"disconnect", mcslib_disconnect},
         {"read", mcslib_read},
         {"stop", mcslib_stop},
         // object functions.
