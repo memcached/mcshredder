@@ -67,7 +67,7 @@ struct mcs_tls_client {
 
 // initialize a global OpenSSL context to use with creating connection SSL
 // objects.
-void *mcs_tls_init(void) {
+void *mcs_tls_init(const char *chain_cert, const char *key, const char *ca_cert) {
     // TODO: check for a reasonable OpenSSL version.
     SSL_CTX *ctx = NULL;
     OPENSSL_init_ssl(0, NULL);
@@ -79,6 +79,22 @@ void *mcs_tls_init(void) {
     // disable older protocols
     SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
     // TODO: check result in case of failure.
+
+    // load certs if we were supplied with them
+    if (chain_cert && key) {
+        if (!SSL_CTX_use_certificate_chain_file(ctx, chain_cert)) {
+            ERR_print_errors_fp(stderr);
+            return NULL;
+        } else if (!SSL_CTX_use_PrivateKey_file(ctx, key, SSL_FILETYPE_PEM)) {
+            ERR_print_errors_fp(stderr);
+            return NULL;
+        } else if (ca_cert) {
+            if (!SSL_CTX_load_verify_locations(ctx, ca_cert, NULL)) {
+                ERR_print_errors_fp(stderr);
+                return NULL;
+            }
+        }
+    }
     return ctx;
 }
 

@@ -14,7 +14,7 @@ struct mcs_tls_client;
 #define TLS_BUF_SIZE_DEFAULT 8192
 
 #ifdef USE_TLS
-void *mcs_tls_init(void);
+void *mcs_tls_init(const char *chain_cert, const char *key, const char *ca_cert);
 int mcs_tls_client_init(struct mcs_func_client *fc, void *ctx);
 enum mcs_tls_ret mcs_tls_do_handshake(struct mcs_tls_client *c);
 // FIXME: -> handshake?

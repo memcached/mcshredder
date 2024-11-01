@@ -3095,6 +3095,9 @@ static void usage(struct mcs_ctx *ctx) {
            "--arg=<key,key=val,key2=val2> (none): arguments to pass to config script\n"
 #ifdef USE_TLS
            "--tls: use TLS for talking to memcached\n"
+           "--tls_chain_cert: use TLS chain certificate file in PEM format\n"
+           "--tls_key: use TLS key if not in chain cert\n"
+           "--tls_ca_cert: use TLS CA cert for certificate verification\n"
 #endif
            "--memprofile: print allocation statistics once per second\n"
           );
@@ -3107,16 +3110,35 @@ static void usage(struct mcs_ctx *ctx) {
 
 int main(int argc, char **argv) {
     struct mcs_conn conn = {.host = "127.0.0.1", .port_num = "11211"};
+
+    enum {
+        MCS_IP = 0,
+        MCS_PORT,
+        MCS_SOCK,
+        MCS_CONF,
+        MCS_ARG,
+        MCS_MEMPROFILE,
+        MCS_TLS,
+        MCS_HELP,
+        MCS_TLS_CHAIN_CERT,
+        MCS_TLS_KEY,
+        MCS_TLS_CA_CERT,
+        MCS_TLS_VERIFY,
+    };
     const struct option longopts[] = {
-        {"ip", required_argument, 0, 'i'},
-        {"port", required_argument, 0, 'p'},
+        {"ip", required_argument, 0, MCS_IP},
+        {"port", required_argument, 0, MCS_PORT},
         // connect to unix socket instead
-        {"sock", required_argument, 0, 's'},
-        {"conf", required_argument, 0, 'c'},
-        {"arg", required_argument, 0, 'a'},
-        {"memprofile", no_argument, 0, 'm'},
-        {"tls", no_argument, 0, 't'},
-        {"help", no_argument, 0, 'h'},
+        {"sock", required_argument, 0, MCS_SOCK},
+        {"conf", required_argument, 0, MCS_CONF},
+        {"arg", required_argument, 0, MCS_ARG},
+        {"memprofile", no_argument, 0, MCS_MEMPROFILE},
+        {"tls", no_argument, 0, MCS_TLS},
+        {"help", no_argument, 0, MCS_HELP},
+        {"tls_chain_cert", required_argument, 0, MCS_TLS_CHAIN_CERT},
+        {"tls_key", required_argument, 0, MCS_TLS_KEY},
+        {"tls_ca_cert", required_argument, 0, MCS_TLS_CA_CERT},
+        {"tls_verify", required_argument, 0, MCS_TLS_VERIFY},
         // end
         {0, 0, 0, 0}
     };
@@ -3147,23 +3169,29 @@ int main(int argc, char **argv) {
     *extra = ctx;
     luaL_openlibs(L);
     register_lua_libs(L);
+#ifdef USE_TLS
+    const char *tls_chain_cert = NULL;
+    const char *tls_key = NULL;
+    const char *tls_ca_cert = NULL;
+    bool use_tls = false;
+#endif
 
     while (-1 != (c = getopt_long(argc, argv, "", longopts, &optindex))) {
         switch (c) {
-        case 'a':
+        case MCS_ARG:
             ctx->arg_ref = _set_arguments(L, optarg);
             break;
-        case 'i':
+        case MCS_IP:
             strncpy(conn.host, optarg, NI_MAXHOST);
             break;
-        case 'p':
+        case MCS_PORT:
             strncpy(conn.port_num, optarg, NI_MAXSERV);
             break;
-        case 's':
+        case MCS_SOCK:
             fprintf(stderr, "unix socket not yet implemented\n");
             return EXIT_FAILURE;
             break;
-        case 'c':
+        case MCS_CONF:
             ctx->conffile = strdup(optarg);
             if (luaL_dofile(L, ctx->conffile) != LUA_OK) {
                 fprintf(stderr, "Failed to load config file: %s\n", lua_tostring(L, -1));
@@ -3171,15 +3199,27 @@ int main(int argc, char **argv) {
             }
             break;
 #ifdef USE_TLS
-        case 't':
-            // TODO: err if nil
-            ctx->tls_ctx = mcs_tls_init();
+        case MCS_TLS:
+            use_tls = true;
+            break;
+        case MCS_TLS_CHAIN_CERT:
+            tls_chain_cert = strdup(optarg);
+            break;
+        case MCS_TLS_KEY:
+            tls_key = strdup(optarg);
+            break;
+        case MCS_TLS_CA_CERT:
+            tls_ca_cert = strdup(optarg);
+            break;
+        case MCS_TLS_VERIFY:
+            fprintf(stderr, "tls verify unimplemented\n");
+            return EXIT_FAILURE;
             break;
 #endif
-        case 'm':
+        case MCS_MEMPROFILE:
             ctx->memprofile = true;
             break;
-        case 'h':
+        case MCS_HELP:
             usage(ctx);
             return EXIT_SUCCESS;
             break;
@@ -3194,6 +3234,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Must provide a config file: --conf etc.lua\n");
         exit(EXIT_FAILURE);
     }
+
+#ifdef USE_TLS
+    if (use_tls) {
+        ctx->tls_ctx = mcs_tls_init(tls_chain_cert, tls_key, tls_ca_cert);
+        if (ctx->tls_ctx == NULL) {
+            fprintf(stderr, "failed to initialize TLS\n");
+            return EXIT_FAILURE;
+        }
+    }
+#endif
 
     // - call "config" global cmd
     lua_getglobal(L, "config");
