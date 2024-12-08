@@ -954,6 +954,7 @@ static int mcs_cfunc_run(void *udata) {
                 c->connected = false;
                 lua_pushboolean(f->L, 0);
                 f->lua_nargs = 1;
+                f->state = mcs_fstate_run;
             } else {
                 if (c->tls) {
                     stop = mcs_tls_postconnect(f, c);
