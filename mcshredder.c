@@ -1422,7 +1422,6 @@ static void mcs_close_cb(void *udata, struct io_uring_cqe *cqe) {
 static void *shredder_thread(void *arg) {
     struct __kernel_timespec timeout_loop = { .tv_sec = 0, .tv_nsec = 500000000 };
     struct mcs_thread *t = arg;
-    t->stop = false;
     func_head_t fhead; // temporary func stack.
     STAILQ_INIT(&fhead);
 
@@ -1912,6 +1911,7 @@ static void _mcs_cleanup_thread(struct mcs_thread *t) {
 static int mcslib_shredder(lua_State *L) {
     struct mcs_ctx *ctx = *(struct mcs_ctx **)lua_getextraspace(L);
 
+    ctx->stop = false;
     ctx->active_threads = 0;
     STAILQ_INIT(&ctx->threads);
     luaL_checktype(L, 1, LUA_TTABLE);
@@ -1930,6 +1930,7 @@ static int mcslib_shredder(lua_State *L) {
     struct mcs_thread *t;
     STAILQ_FOREACH(t, &ctx->threads, next) {
         int ret;
+        t->stop = false;
         ret = pthread_create(&t->tid, NULL, shredder_thread, t);
         if (ret != 0) {
             fprintf(stderr, "Failed to start shredder thread: %s\n",
